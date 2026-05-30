@@ -2,6 +2,7 @@ import cv2
 import os
 import time
 import numpy as np
+import torch
 from models.rvm import RVMStrategy
 from models.hybrid_rvm import HybridStrategy
 from models.yolo_sam2 import YOLO_SAM2_Strategy
@@ -11,7 +12,7 @@ class SpacetimeSlicer:
         self.input_dir = input_dir
         self.output_root = output_root
         self.fps = fps
-        self.device = "cuda" if cv2.cuda.getCudaEnabledDeviceCount() > 0 else "cpu"
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
         
         self.frame_paths = sorted([os.path.join(input_dir, f) for f in os.listdir(input_dir) 
                                    if f.endswith(('.png', '.jpg', '.jpeg'))])
@@ -151,9 +152,18 @@ if __name__ == "__main__":
     print(f"{'='*50}")
 
     slicer = SpacetimeSlicer(INPUT_DIR, OUTPUT_ROOT, fps=25)
+    print(f"使用设备: {slicer.device}")
     
-    strategy = RVMStrategy(slicer.device)
+    METHOD = 'RVM'
+    if METHOD == 'RVM':
+        strategy = RVMStrategy(slicer.device)
+    elif METHOD == 'Hybrid':
+        strategy = HybridStrategy(slicer.device)
+    elif METHOD == 'SAM2_BBox':
+        strategy = YOLO_SAM2_Strategy(slicer.device)
+    else:
+        raise ValueError(f"Unknown method: {METHOD}")
     
-    slicer.generate('RVM', START_FRAME, END_FRAME, ghost_interval=GHOST_INTERVAL, edge_feather=EDGE_FEATHER, fade_duration_frames=FADE_DURATION_FRAMES)
+    slicer.generate(METHOD, START_FRAME, END_FRAME, ghost_interval=GHOST_INTERVAL, edge_feather=EDGE_FEATHER, fade_duration_frames=FADE_DURATION_FRAMES)
 
     print(f"\n⏱️ 总耗时: {time.time() - start_time:.2f}秒")
