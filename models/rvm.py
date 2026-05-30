@@ -7,7 +7,7 @@ class RVMStrategy(SegmentationStrategy):
     def __init__(self, device):
         print(">> 初始化 RVM 分割器...")
         self.device = device
-        self.model = torch.hub.load("PeterL1n/RobustVideoMatting", "resnet50").to(self.device).eval()
+        self.model = torch.hub.load("C:\\Users\\Administrator\\.cache\\torch\\hub\\PeterL1n_RobustVideoMatting_master", "resnet50", source='local').to(self.device).eval()
         self.rec = [None] * 4
         self.transform = transforms.ToTensor()
 
