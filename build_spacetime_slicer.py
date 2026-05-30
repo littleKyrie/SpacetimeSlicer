@@ -68,10 +68,11 @@ class SpacetimeSlicer:
                 kernel = np.ones((3, 3), np.uint8)
                 alpha_mask = cv2.erode(alpha_mask, kernel, iterations=abs(edge_feather))
 
-            img_bgra = cv2.cvtColor(current_frame, cv2.COLOR_BGR2BGRA)
-            img_bgra[:, :, 3] = alpha_mask
-            png_filename = os.path.join(extracted_pngs_dir, f"extracted_{i:05d}.png")
-            cv2.imwrite(png_filename, img_bgra)
+            # PNG 保存已禁用，需要时取消注释
+            # img_bgra = cv2.cvtColor(current_frame, cv2.COLOR_BGR2BGRA)
+            # img_bgra[:, :, 3] = alpha_mask
+            # png_filename = os.path.join(extracted_pngs_dir, f"extracted_{i:05d}.png")
+            # cv2.imwrite(png_filename, img_bgra)
 
             should_be_ghost = (i == effect_start_idx) or ((i - effect_start_idx) % ghost_interval == 0)
 
@@ -83,7 +84,7 @@ class SpacetimeSlicer:
             out.write(frame_output)
 
             if should_be_ghost:
-                canvas_ghosts = np.where(mask_binary, current_frame, canvas_ghosts)
+                canvas_ghosts = frame_output#np.where(mask_binary, current_frame, canvas_ghosts)#这里也要用alpha_normalized来做融合，而不是直接把current frame覆盖上去
                 ghost_list.append({
                     'frame': current_frame.copy(),
                     'alpha': alpha_mask.copy()
@@ -97,32 +98,54 @@ class SpacetimeSlicer:
         
         # 获取最后一帧画面（用于定格）
         last_frame = self.read_frame(effect_end_idx - 1)
+        background = last_frame
         
         # 第一步：定格画面，残影按顺序逐个消失（先产生的先消失）
-        # 每个残影消失占用的帧数
-        frames_per_ghost = max(1, (fade_duration_frames if fade_duration_frames is not None else ghost_interval) // max(len(ghost_list), 1))
+        # 每个残影保持完全不透明的帧数
+        hold_frames_per_ghost = max(2, (fade_duration_frames if fade_duration_frames is not None else ghost_interval * 2) // max(len(ghost_list), 1))
         
-        active_ghost_indices = list(range(len(ghost_list)))  # 当前活跃的残影索引
+        active_ghost_indices = list(range(len(ghost_list)))  # 当前活跃的残影索引（按生成顺序）
         
-        # 逐个移除残影
-        for ghost_idx in range(len(ghost_list)):
-            # 构建当前活跃残影的 canvas
-            current_canvas = background.copy()
-            for idx in active_ghost_indices:
-                ghost = ghost_list[idx]
-                ghost_alpha = np.repeat(ghost['alpha'][:, :, np.newaxis], 3, axis=2) / 255.0
-                current_canvas = (ghost['frame'] * ghost_alpha + current_canvas * (1 - ghost_alpha)).astype(np.uint8)
-            
-            # 混合最后一帧和当前残影canvas
-            frame_output = (last_frame * 0.5 + current_canvas * 0.5).astype(np.uint8)
-            
-            # 每个残影消失时重复几帧（让消失过程可见）
-            for _ in range(frames_per_ghost):
+        # 逐个移除残影：先保持完全不透明，最后几帧淡出
+        fade_out_frames = max(1, hold_frames_per_ghost // 3)  # 淡出占用的帧数
+        hold_frames = hold_frames_per_ghost - fade_out_frames  # 保持不透明的帧数
+        
+        # 按生成顺序逐个消失：先生成的先消失，最后生成的最后消失
+        for ghost_idx_to_remove in range(len(ghost_list)):
+            # 阶段1：当前要消失的残影保持完全不透明，显示几帧
+            for _ in range(hold_frames):
+                current_canvas = background.copy()
+                for idx in active_ghost_indices:
+                    ghost = ghost_list[idx]
+                    ghost_alpha_3ch = np.repeat(ghost['alpha'][:, :, np.newaxis], 3, axis=2) / 255.0
+                    current_canvas = (ghost['frame'] * ghost_alpha_3ch + current_canvas * (1 - ghost_alpha_3ch)).astype(np.uint8)
+                
+                frame_output = current_canvas
                 out.write(frame_output)
             
-            # 移除最早的残影（先产生的先消失）
-            active_ghost_indices.pop(0)
-            print(f"  > 残影消失: {ghost_idx+1}/{len(ghost_list)} (剩余 {len(active_ghost_indices)} 个)", end='\r')
+            # 阶段2：要消失的残影逐渐变透明然后消失
+            for step in range(fade_out_frames):
+                fade_ratio = 1.0 - (step + 1) / fade_out_frames  # 从1.0到0.0
+                
+                current_canvas = background.copy()
+                for idx in active_ghost_indices:
+                    ghost = ghost_list[idx]
+                    ghost_alpha = ghost['alpha'].copy()
+                    
+                    # 只有当前要消失的残影（按生成顺序）才变透明
+                    if idx == ghost_idx_to_remove:
+                        ghost_alpha = (ghost_alpha * fade_ratio).astype(np.uint8)
+                    
+                    ghost_alpha_3ch = np.repeat(ghost_alpha[:, :, np.newaxis], 3, axis=2) / 255.0
+                    current_canvas = (ghost['frame'] * ghost_alpha_3ch + current_canvas * (1 - ghost_alpha_3ch)).astype(np.uint8)
+                
+                frame_output = current_canvas
+                out.write(frame_output)
+            
+            # 移除已消失的残影（按生成顺序）
+            active_ghost_indices.remove(ghost_idx_to_remove)
+            
+            print(f"  > 残影消失: {ghost_idx_to_remove+1}/{len(ghost_list)} (剩余 {len(active_ghost_indices)} 个)", end='\r')
         
         # 第二步：残影完全消失后，继续播放正常视频
         for i in range(effect_end_idx, self.total_frames):
@@ -143,9 +166,9 @@ if __name__ == "__main__":
     
     START_FRAME = 25
     END_FRAME = 220
-    GHOST_INTERVAL = 15
-    EDGE_FEATHER = -8
-    FADE_DURATION_FRAMES = 60  # 片尾定格淡出持续帧数
+    GHOST_INTERVAL = 45
+    EDGE_FEATHER = -5
+    FADE_DURATION_FRAMES = 25  # 片尾定格淡出持续帧数
 
     print(f"\n{'='*50}")
     print(f"🚀 开始制作时空切片: [RVM] ({START_FRAME} -> {END_FRAME}), 残影间隔={GHOST_INTERVAL}, 边缘处理={EDGE_FEATHER}, 淡出帧数={FADE_DURATION_FRAMES}")
