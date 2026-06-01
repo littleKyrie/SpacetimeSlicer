@@ -38,7 +38,7 @@ class SpacetimeSlicer:
         for cam_id in self.camera_ids:
             frame_paths = []
             for subdir in self.subdirs:
-                frame_filename = f"{subdir} {cam_id:03d}.jpg"
+                frame_filename = f"{cam_id:03d}.jpg"
                 frame_path = os.path.join(input_dir, subdir, frame_filename)
                 if os.path.exists(frame_path):
                     frame_paths.append(frame_path)
@@ -59,7 +59,8 @@ class SpacetimeSlicer:
                         all_ghosts, permanent_indices, out, initial_canvas=None):
         """处理一段特效"""
         if initial_canvas is None:
-            background = self.read_frame(0, camera_id).copy()
+            # background = self.read_frame(0, camera_id).copy()
+            background = self.read_frame(start_idx, camera_id).copy()
             canvas_ghosts = background.copy()
         else:
             canvas_ghosts = initial_canvas.copy()
@@ -109,7 +110,7 @@ class SpacetimeSlicer:
         # 先为每个机位生成凝结状态
         for cam_id in camera_ids:
             print(f"\n  预计算机位 {cam_id} 的凝结状态...")
-            background = self.read_frame(0, cam_id).copy()
+            background = self.read_frame(effect_start_idx, cam_id).copy()
             canvas_ghosts = background.copy()
             cam_ghosts = []
             cam_permanent = []
@@ -238,8 +239,8 @@ class SpacetimeSlicer:
 
         # 4. 特效段2：终止机位，凝结帧+1 -> 结束帧
         # 清空残影数据，只保留终止机位的残影用于片尾消失
-        all_ghosts.clear()
-        permanent_indices.clear()
+        # all_ghosts.clear()
+        # permanent_indices.clear()
 
         print(f"\n✨ 特效段2: 机位 {end_cam} ({freeze_idx + 1} -> {effect_end_idx})")
         final_canvas, ghost_count = self.process_segment(
@@ -285,6 +286,7 @@ if __name__ == "__main__":
     start_time = time.time()
 
     slicer = SpacetimeSlicer(args.input_dir, args.output_root, fps=args.fps, camera_ids=camera_ids)
+    # slicer.device = "cpu"
     print(f"使用设备: {slicer.device}")
 
     end_frame = args.end_frame if args.end_frame is not None else slicer.total_frames
