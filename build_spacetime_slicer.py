@@ -20,8 +20,16 @@ class StretchedFrameWriter:
         self.stretch = max(1, stretch)
         self.mode = mode
         self.pending_frame = None
+        self.frames = []
+        self.emitted_intervals = 0
 
     def write(self, frame):
+        if self.mode == 'cubic':
+            self.frames.append(frame.copy())
+            if len(self.frames) >= 3:
+                self._write_cubic_interval(len(self.frames) - 3)
+            return
+
         if self.mode == 'repeat' or self.stretch == 1:
             self.slicer.write_frame_repeat(self.out, frame, self.stretch)
             return
@@ -33,9 +41,25 @@ class StretchedFrameWriter:
         self.pending_frame = frame.copy()
 
     def finish(self):
+        if self.mode == 'cubic':
+            while self.emitted_intervals < max(0, len(self.frames) - 1):
+                self._write_cubic_interval(self.emitted_intervals)
+            if self.frames:
+                self.slicer.write_frame_repeat(self.out, self.frames[-1], self.stretch)
+            self.frames.clear()
+            return
+
         if self.pending_frame is not None:
             self.slicer.write_frame_repeat(self.out, self.pending_frame, self.stretch)
             self.pending_frame = None
+
+    def _write_cubic_interval(self, interval_idx):
+        p0 = self.frames[max(0, interval_idx - 1)]
+        p1 = self.frames[interval_idx]
+        p2 = self.frames[interval_idx + 1]
+        p3 = self.frames[min(len(self.frames) - 1, interval_idx + 2)]
+        self.slicer.write_cubic_transition(self.out, p0, p1, p2, p3, self.stretch)
+        self.emitted_intervals += 1
 
 
 def parse_camera_ids(s):
@@ -148,6 +172,39 @@ class SpacetimeSlicer:
             )
             out.write(frame)
 
+    def interpolate_cubic_array(self, p0, p1, p2, p3, ratio):
+        p0 = p0.astype(np.float32)
+        p1 = p1.astype(np.float32)
+        p2 = p2.astype(np.float32)
+        p3 = p3.astype(np.float32)
+        ratio_squared = ratio * ratio
+        ratio_cubed = ratio_squared * ratio
+        interpolated = 0.5 * (
+            (2.0 * p1) +
+            (-p0 + p2) * ratio +
+            (2.0 * p0 - 5.0 * p1 + 4.0 * p2 - p3) * ratio_squared +
+            (-p0 + 3.0 * p1 - 3.0 * p2 + p3) * ratio_cubed
+        )
+        # Avoid halos caused by cubic overshoot near moving high-contrast edges.
+        return np.clip(interpolated, np.minimum(p1, p2), np.maximum(p1, p2)).astype(np.uint8)
+
+    def interpolate_cubic_values(self, p0, p1, p2, p3, ratio):
+        ratio_squared = ratio * ratio
+        ratio_cubed = ratio_squared * ratio
+        interpolated = 0.5 * (
+            (2.0 * p1) +
+            (-p0 + p2) * ratio +
+            (2.0 * p0 - 5.0 * p1 + 4.0 * p2 - p3) * ratio_squared +
+            (-p0 + 3.0 * p1 - 3.0 * p2 + p3) * ratio_cubed
+        )
+        return np.clip(interpolated, np.minimum(p1, p2), np.maximum(p1, p2))
+
+    def write_cubic_transition(self, out, p0, p1, p2, p3, stretch):
+        for step in range(max(1, stretch)):
+            ratio = step / stretch
+            frame = p1 if step == 0 else self.interpolate_cubic_array(p0, p1, p2, p3, ratio)
+            out.write(frame)
+
     def build_temporal_median_background(self, camera_id, max_samples=31):
         """Build a clean plate for a static camera without keeping one source-frame subject."""
         frame_count = len(self.frame_paths_dict[camera_id])
@@ -162,6 +219,59 @@ class SpacetimeSlicer:
         if fade_duration_frames is not None:
             return fade_duration_frames
         return max(effect_frame_count, max(2, self.fps // 2))
+
+    def get_ghost_geometry(self, ghost):
+        if 'geometry' in ghost:
+            return ghost['geometry']
+
+        mask_points = cv2.findNonZero((ghost['alpha'] > 8).astype(np.uint8))
+        if mask_points is None:
+            h, w = ghost['alpha'].shape
+            geometry = np.array([w / 2.0, h / 2.0, float(w), float(h)], dtype=np.float32)
+        else:
+            x, y, w, h = cv2.boundingRect(mask_points)
+            geometry = np.array([x + w / 2.0, y + h / 2.0, float(w), float(h)], dtype=np.float32)
+        ghost['geometry'] = geometry
+        return geometry
+
+    def align_ghost_to_geometry(self, ghost, target_geometry):
+        frame_h, frame_w = ghost['alpha'].shape
+        source_geometry = self.get_ghost_geometry(ghost)
+        source_w = max(1, int(round(source_geometry[2])))
+        source_h = max(1, int(round(source_geometry[3])))
+        source_x = int(round(source_geometry[0] - source_w / 2.0))
+        source_y = int(round(source_geometry[1] - source_h / 2.0))
+        source_x = min(max(0, source_x), frame_w - 1)
+        source_y = min(max(0, source_y), frame_h - 1)
+        source_w = min(source_w, frame_w - source_x)
+        source_h = min(source_h, frame_h - source_y)
+
+        target_w = max(1, int(round(target_geometry[2])))
+        target_h = max(1, int(round(target_geometry[3])))
+        target_x = int(round(target_geometry[0] - target_w / 2.0))
+        target_y = int(round(target_geometry[1] - target_h / 2.0))
+
+        frame_crop = ghost['frame'][source_y:source_y + source_h, source_x:source_x + source_w]
+        alpha_crop = ghost['alpha'][source_y:source_y + source_h, source_x:source_x + source_w]
+        resized_frame = cv2.resize(frame_crop, (target_w, target_h), interpolation=cv2.INTER_LINEAR)
+        resized_alpha = cv2.resize(alpha_crop, (target_w, target_h), interpolation=cv2.INTER_LINEAR)
+
+        aligned_frame = np.zeros_like(ghost['frame'])
+        aligned_alpha = np.zeros_like(ghost['alpha'])
+        dst_x0 = max(0, target_x)
+        dst_y0 = max(0, target_y)
+        dst_x1 = min(frame_w, target_x + target_w)
+        dst_y1 = min(frame_h, target_y + target_h)
+        if dst_x0 >= dst_x1 or dst_y0 >= dst_y1:
+            return aligned_frame, aligned_alpha
+
+        src_x0 = dst_x0 - target_x
+        src_y0 = dst_y0 - target_y
+        src_x1 = src_x0 + (dst_x1 - dst_x0)
+        src_y1 = src_y0 + (dst_y1 - dst_y0)
+        aligned_frame[dst_y0:dst_y1, dst_x0:dst_x1] = resized_frame[src_y0:src_y1, src_x0:src_x1]
+        aligned_alpha[dst_y0:dst_y1, dst_x0:dst_x1] = resized_alpha[src_y0:src_y1, src_x0:src_x1]
+        return aligned_frame, aligned_alpha
 
     def process_segment(self, strategy, camera_id, start_idx, end_idx, ghost_interval, edge_feather,
                         all_ghosts, permanent_indices, out, initial_canvas=None,
@@ -243,12 +353,60 @@ class SpacetimeSlicer:
 
         print(f"\n  ✅ 凝结转场完成: 共 {len(camera_ids)} 个视角 × {stretch_freeze}")
 
-    def interpolate_ghost(self, all_ghosts, position):
+    def interpolate_ghost(self, all_ghosts, position, mode='blend'):
         lower_idx = int(np.floor(position))
         upper_idx = min(lower_idx + 1, len(all_ghosts) - 1)
         ratio = position - lower_idx
         if upper_idx == lower_idx or ratio <= 0:
             return all_ghosts[lower_idx]
+
+        if mode == 'cutout':
+            p0_idx = max(0, lower_idx - 1)
+            p3_idx = min(len(all_ghosts) - 1, upper_idx + 1)
+            target_geometry = self.interpolate_cubic_values(
+                self.get_ghost_geometry(all_ghosts[p0_idx]),
+                self.get_ghost_geometry(all_ghosts[lower_idx]),
+                self.get_ghost_geometry(all_ghosts[upper_idx]),
+                self.get_ghost_geometry(all_ghosts[p3_idx]),
+                ratio,
+            )
+            lower_frame, lower_alpha = self.align_ghost_to_geometry(
+                all_ghosts[lower_idx], target_geometry
+            )
+            upper_frame, upper_alpha = self.align_ghost_to_geometry(
+                all_ghosts[upper_idx], target_geometry
+            )
+            lower_alpha_f = lower_alpha.astype(np.float32) / 255.0
+            upper_alpha_f = upper_alpha.astype(np.float32) / 255.0
+            mixed_alpha_f = lower_alpha_f * (1.0 - ratio) + upper_alpha_f * ratio
+            mixed_premultiplied = (
+                lower_frame.astype(np.float32) * lower_alpha_f[:, :, np.newaxis] * (1.0 - ratio) +
+                upper_frame.astype(np.float32) * upper_alpha_f[:, :, np.newaxis] * ratio
+            )
+            mixed_frame = np.divide(
+                mixed_premultiplied,
+                mixed_alpha_f[:, :, np.newaxis],
+                out=np.zeros_like(mixed_premultiplied),
+                where=mixed_alpha_f[:, :, np.newaxis] > 1e-6,
+            )
+            return {
+                'frame': np.clip(mixed_frame, 0, 255).astype(np.uint8),
+                'alpha': np.clip(mixed_alpha_f * 255.0, 0, 255).astype(np.uint8),
+            }
+
+        if mode == 'cubic':
+            p0_idx = max(0, lower_idx - 1)
+            p3_idx = min(len(all_ghosts) - 1, upper_idx + 1)
+            return {
+                'frame': self.interpolate_cubic_array(
+                    all_ghosts[p0_idx]['frame'], all_ghosts[lower_idx]['frame'],
+                    all_ghosts[upper_idx]['frame'], all_ghosts[p3_idx]['frame'], ratio
+                ),
+                'alpha': self.interpolate_cubic_array(
+                    all_ghosts[p0_idx]['alpha'], all_ghosts[lower_idx]['alpha'],
+                    all_ghosts[upper_idx]['alpha'], all_ghosts[p3_idx]['alpha'], ratio
+                ),
+            }
 
         lower_ghost = all_ghosts[lower_idx]
         upper_ghost = all_ghosts[upper_idx]
@@ -275,13 +433,13 @@ class SpacetimeSlicer:
         return trajectories
 
     def compose_recovery_frame(self, all_ghosts, permanent_indices, ghost_trajectories, background,
-                               frame_offset):
+                               frame_offset, interpolation_mode='blend'):
         current_canvas = background.copy()
         for p_idx in permanent_indices:
             trajectory = ghost_trajectories.get(p_idx)
             if trajectory is None:
                 continue
-            ghost = self.interpolate_ghost(all_ghosts, trajectory[frame_offset])
+            ghost = self.interpolate_ghost(all_ghosts, trajectory[frame_offset], interpolation_mode)
             ghost_opacity = all_ghosts[p_idx].get('opacity', 1.0)
             ghost_alpha_3ch = np.repeat(
                 ghost['alpha'][:, :, np.newaxis], 3, axis=2
@@ -294,11 +452,12 @@ class SpacetimeSlicer:
     def write_canvas_transition(self, out, first_frame, second_frame, transition_frames):
         for step in range(1, transition_frames + 1):
             ratio = step / (transition_frames + 1)
+            ratio = ratio * ratio * (3.0 - 2.0 * ratio)
             out.write(cv2.addWeighted(first_frame, 1.0 - ratio, second_frame, ratio, 0))
 
     def process_fade_out(self, out, all_ghosts, permanent_indices, background, total_fade_frames,
                          stretch_fade=1, stretch_mode='repeat', transition_from=None,
-                         recovery_transition_frames=0):
+                         recovery_transition_frames=0, recovery_interp_mode='cutout'):
         """处理片尾淡出（应用残影透明度渐变，保留原残影的透明度）"""
         output_fade_frames = total_fade_frames * max(1, stretch_fade)
         print(f"\n🎞️ 写入片尾（定格 + 残影回收消失）...")
@@ -328,7 +487,7 @@ class SpacetimeSlicer:
             return
 
         first_recovery_frame = self.compose_recovery_frame(
-            all_ghosts, permanent_indices, ghost_trajectories, background, 0
+            all_ghosts, permanent_indices, ghost_trajectories, background, 0, recovery_interp_mode
         )
         if transition_from is not None:
             self.write_canvas_transition(
@@ -337,7 +496,8 @@ class SpacetimeSlicer:
 
         for frame_offset in range(output_fade_frames):
             current_canvas = self.compose_recovery_frame(
-                all_ghosts, permanent_indices, ghost_trajectories, background, frame_offset
+                all_ghosts, permanent_indices, ghost_trajectories, background, frame_offset,
+                recovery_interp_mode
             )
             out.write(current_canvas)
             print(f"  > 消失进度: {frame_offset+1}/{output_fade_frames}", end='\r')
@@ -349,7 +509,8 @@ class SpacetimeSlicer:
                  stretch_head=1, stretch_ghost=1, stretch_fade=1,
                  stretch_freeze=1, stretch_tail=1, stretch_mode='repeat',
                  background_mode='freeze', recovery_transition_frames=3,
-                 initial_subject_patch_mode='median'):
+                 initial_subject_patch_mode='median', recovery_interp_mode='cutout',
+                 ghost_interp_mode=None, freeze_interp_mode=None):
         """
         生成时空切片视频（残影渐变 → 回收 → 多视角凝结 → 继续播放）
 
@@ -379,6 +540,8 @@ class SpacetimeSlicer:
             raise ValueError("recovery_transition_frames must not be negative")
         if min(stretch_head, stretch_ghost, stretch_fade, stretch_freeze, stretch_tail) < 1:
             raise ValueError("stretch values must be at least 1")
+        ghost_interp_mode = ghost_interp_mode or stretch_mode
+        freeze_interp_mode = freeze_interp_mode or stretch_mode
 
         start_cam = camera_ids[0]
         end_cam = camera_ids[-1]
@@ -390,7 +553,7 @@ class SpacetimeSlicer:
         if effect_end_idx > len(self.frame_paths_dict[end_cam]):
             raise ValueError(f"Camera {end_cam} does not contain frames up to {effect_end_idx - 1}")
 
-        stretch_suffix = f"_sh{stretch_head}_sg{stretch_ghost}_sfd{stretch_fade}_sfz{stretch_freeze}_st{stretch_tail}_{stretch_mode}_patch{initial_subject_patch_mode}_recoverybg{background_mode}_rt{recovery_transition_frames}"
+        stretch_suffix = f"_sh{stretch_head}_sg{stretch_ghost}_sfd{stretch_fade}_sfz{stretch_freeze}_st{stretch_tail}_{stretch_mode}_gi{ghost_interp_mode}_fi{freeze_interp_mode}_ri{recovery_interp_mode}_patch{initial_subject_patch_mode}_recoverybg{background_mode}_rt{recovery_transition_frames}"
         run_name = f"freeze_{start_cam}_to_{end_cam}_seq{len(camera_ids)}_s{effect_start_idx}_f{freeze_idx}_e{effect_end_idx}{stretch_suffix}"
         output_dir = os.path.join(self.output_root, run_name)
         os.makedirs(output_dir, exist_ok=True)
@@ -440,7 +603,7 @@ class SpacetimeSlicer:
             ghost_opacity_start=ghost_opacity_start,
             ghost_opacity_end=ghost_opacity_end,
             stretch_ghost=stretch_ghost,
-            stretch_mode=stretch_mode
+            stretch_mode=ghost_interp_mode
         )
 
         # ============ 3. 片尾淡出: 回收所有残影 ============
@@ -455,12 +618,13 @@ class SpacetimeSlicer:
         self.process_fade_out(out, all_ghosts, permanent_indices, fade_background, total_fade_frames,
                               stretch_fade=stretch_fade, stretch_mode=stretch_mode,
                               transition_from=last_effect_frame,
-                              recovery_transition_frames=recovery_transition_frames)
+                              recovery_transition_frames=recovery_transition_frames,
+                              recovery_interp_mode=recovery_interp_mode)
 
         # ============ 4. 凝结转场: 多机位环绕 ============
         print(f"\n💫 进入凝结状态，多机位环绕...")
         self.process_freeze_transition(camera_ids, freeze_idx, out, stretch_freeze=stretch_freeze,
-                                       stretch_mode=stretch_mode)
+                                       stretch_mode=freeze_interp_mode)
 
         # ============ 5. 继续播放: 凝结帧之后 -> 结束帧 ============
         if freeze_idx + 1 < effect_end_idx:
@@ -505,8 +669,18 @@ if __name__ == "__main__":
     parser.add_argument('--stretch_fade', type=int, default=1, help='切片回收段每帧重复次数, 默认:1')
     parser.add_argument('--stretch_freeze', type=int, default=1, help='凝结转场每帧重复次数, 默认:1')
     parser.add_argument('--stretch_tail', type=int, default=1, help='片尾每帧重复次数, 默认:1')
-    parser.add_argument('--stretch_mode', type=str, default='repeat', choices=['repeat', 'blend', 'flow'],
-                        help='延时模式: repeat=重复帧, blend=线性混合, flow=光流插帧')
+    parser.add_argument('--stretch_mode', type=str, default='cubic',
+                        choices=['repeat', 'blend', 'cubic', 'flow'],
+                        help='延时模式: repeat=重复帧, blend=线性混合, cubic=四帧三次插值, flow=光流插帧')
+    parser.add_argument('--recovery_interp_mode', type=str, default='cutout',
+                        choices=['blend', 'cubic', 'cutout'],
+                        help='残影回收插值: cutout=RVM人物对齐后混合, cubic=三次像素插值, blend=线性像素插值')
+    parser.add_argument('--ghost_interp_mode', type=str, default=None,
+                        choices=['repeat', 'blend', 'cubic', 'flow'],
+                        help='切片生成插值模式，默认继承 stretch_mode')
+    parser.add_argument('--freeze_interp_mode', type=str, default=None,
+                        choices=['repeat', 'blend', 'cubic', 'flow'],
+                        help='凝结环绕插值模式，默认继承 stretch_mode')
     parser.add_argument('--background_mode', type=str, default='freeze', choices=['median', 'freeze', 'start'],
                         help='回收画布背景: median=时间中位数干净背景, freeze=凝结帧, start=起始帧')
     parser.add_argument('--initial_subject_patch_mode', type=str, default='median', choices=['median', 'freeze'],
@@ -557,6 +731,8 @@ if __name__ == "__main__":
     print(f"   时间: 起始帧={args.start_frame} -> 凝结帧={args.freeze_frame} -> 结束帧={end_frame}")
     print(f"   参数: ghost_interval={args.ghost_interval}, edge_feather={args.edge_feather}, fade_duration={fade_duration}, opacity={args.ghost_opacity_start}->{args.ghost_opacity_end}")
     print(f"   插帧: mode={args.stretch_mode}, head={args.stretch_head}, ghost={args.stretch_ghost}, fade={args.stretch_fade}, freeze={args.stretch_freeze}, tail={args.stretch_tail}")
+    print(f"   分阶段插值: ghost={args.ghost_interp_mode or args.stretch_mode}, "
+          f"recovery={args.recovery_interp_mode}, freeze={args.freeze_interp_mode or args.stretch_mode}")
     print(f"   起始人物补洞: {args.initial_subject_patch_mode}")
     print(f"   回收画布: background={args.background_mode}, transition={args.recovery_transition_frames}帧")
     print(f"{'='*50}")
@@ -580,7 +756,10 @@ if __name__ == "__main__":
         stretch_mode=args.stretch_mode,
         background_mode=args.background_mode,
         recovery_transition_frames=args.recovery_transition_frames,
-        initial_subject_patch_mode=args.initial_subject_patch_mode
+        initial_subject_patch_mode=args.initial_subject_patch_mode,
+        recovery_interp_mode=args.recovery_interp_mode,
+        ghost_interp_mode=args.ghost_interp_mode,
+        freeze_interp_mode=args.freeze_interp_mode
     )
 
     print(f"\n⏱️ 总耗时: {time.time() - start_time:.2f}秒")

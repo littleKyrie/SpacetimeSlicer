@@ -139,7 +139,7 @@ class SpacetimeSlicerTest(unittest.TestCase):
         )
 
         values = [int(frame[0, 0, 0]) for frame in out.frames]
-        self.assertEqual(values, [30, 60, 90])
+        self.assertEqual(values, [19, 60, 101])
 
     def test_recovery_trajectory_uses_fractional_smoothstep_positions(self):
         slicer = SpacetimeSlicer.__new__(SpacetimeSlicer)
@@ -220,6 +220,65 @@ class SpacetimeSlicerTest(unittest.TestCase):
 
         values = [int(frame[0, 0, 0]) for frame in out.frames]
         self.assertEqual(values, [0, 25, 50, 75, 100, 100, 100, 100])
+
+    def test_cubic_stretch_uses_four_frame_context_without_repeating_intermediate_frames(self):
+        slicer = SpacetimeSlicer.__new__(SpacetimeSlicer)
+        out = FrameCollector()
+        writer = StretchedFrameWriter(slicer, out, stretch=2, mode='cubic')
+        for value in [0, 100, 200, 255]:
+            writer.write(np.full((1, 1, 3), value, dtype=np.uint8))
+        writer.finish()
+
+        values = [int(frame[0, 0, 0]) for frame in out.frames]
+        self.assertEqual(len(values), 8)
+        self.assertEqual(values[0], 0)
+        self.assertEqual(values[-1], 255)
+        self.assertGreater(len(set(values)), 4)
+
+    def test_cubic_interpolation_clamps_overshoot(self):
+        slicer = SpacetimeSlicer.__new__(SpacetimeSlicer)
+
+        interpolated = slicer.interpolate_cubic_array(
+            np.full((1, 1), 0, dtype=np.uint8),
+            np.full((1, 1), 100, dtype=np.uint8),
+            np.full((1, 1), 110, dtype=np.uint8),
+            np.full((1, 1), 255, dtype=np.uint8),
+            0.5,
+        )
+
+        self.assertGreaterEqual(int(interpolated[0, 0]), 100)
+        self.assertLessEqual(int(interpolated[0, 0]), 110)
+
+    def test_recovery_cubic_interpolation_uses_neighboring_ghosts(self):
+        slicer = SpacetimeSlicer.__new__(SpacetimeSlicer)
+        alpha = np.full((1, 1), 255, dtype=np.uint8)
+        all_ghosts = [
+            {'frame': np.full((1, 1, 3), value, dtype=np.uint8), 'alpha': alpha}
+            for value in [0, 50, 100, 255]
+        ]
+
+        cubic = slicer.interpolate_ghost(all_ghosts, 1.5, mode='cubic')
+        blend = slicer.interpolate_ghost(all_ghosts, 1.5, mode='blend')
+
+        self.assertNotEqual(int(cubic['frame'][0, 0, 0]), int(blend['frame'][0, 0, 0]))
+
+    def test_recovery_cutout_interpolation_aligns_subject_before_blending(self):
+        slicer = SpacetimeSlicer.__new__(SpacetimeSlicer)
+        first_alpha = np.zeros((1, 5), dtype=np.uint8)
+        first_alpha[0, 1] = 255
+        second_alpha = np.zeros((1, 5), dtype=np.uint8)
+        second_alpha[0, 3] = 255
+        all_ghosts = [
+            {'frame': np.full((1, 5, 3), 100, dtype=np.uint8), 'alpha': first_alpha},
+            {'frame': np.full((1, 5, 3), 200, dtype=np.uint8), 'alpha': second_alpha},
+        ]
+
+        cutout = slicer.interpolate_ghost(all_ghosts, 0.5, mode='cutout')
+        blend = slicer.interpolate_ghost(all_ghosts, 0.5, mode='blend')
+
+        self.assertEqual(cutout['alpha'][0].tolist(), [0, 0, 255, 0, 0])
+        self.assertEqual(blend['alpha'][0].tolist(), [0, 128, 0, 128, 0])
+        self.assertEqual(int(cutout['frame'][0, 2, 0]), 150)
 
     def test_flow_interpolation_keeps_identical_frames_unchanged(self):
         slicer = SpacetimeSlicer.__new__(SpacetimeSlicer)
