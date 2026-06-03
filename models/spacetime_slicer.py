@@ -199,17 +199,37 @@ class SpacetimeSlicer:
 
         return canvas_ghosts, ghost_count, last_frame_output
 
-    def process_freeze_transition(self, camera_ids, freeze_idx, out, stretch_freeze=1):
+    def process_freeze_transition(self, camera_ids, freeze_idx, out, stretch_freeze=1,
+                                  interpolation_mode='rife'):
         """处理凝结转场阶段（回收残影后的多视角环绕）
         按输入机位顺序输出每个机位在 freeze_idx 的帧，产生多视角效果
         """
         print(f"\n处理凝结转场: {len(camera_ids)} 个机位 ({camera_ids[0]} -> {camera_ids[-1]})")
 
-        stage_writer = self.create_rife_writer(out, stretch_freeze, 0, len(camera_ids) - 1)
-        for i, cam_id in enumerate(camera_ids):
-            frame = self.read_frame(freeze_idx, cam_id)
-            stage_writer.write(frame, i)
-            print(f"    机位 {cam_id} 转场帧 {i+1}/{len(camera_ids)}", end='\r')
+        if interpolation_mode == 'rife':
+            stage_writer = self.create_rife_writer(out, stretch_freeze, 0, len(camera_ids) - 1)
+            for i, cam_id in enumerate(camera_ids):
+                frame = self.read_frame(freeze_idx, cam_id)
+                stage_writer.write(frame, i)
+                print(f"    机位 {cam_id} 转场帧 {i+1}/{len(camera_ids)}", end='\r')
+        elif interpolation_mode == 'repeat':
+            for i, cam_id in enumerate(camera_ids):
+                frame = self.read_frame(freeze_idx, cam_id)
+                self.write_frame_repeat(out, frame, stretch_freeze)
+                print(f"    机位 {cam_id} 转场帧 {i+1}/{len(camera_ids)}", end='\r')
+        elif interpolation_mode == 'blend':
+            previous_frame = None
+            for i, cam_id in enumerate(camera_ids):
+                frame = self.read_frame(freeze_idx, cam_id)
+                if previous_frame is not None:
+                    for step in range(1, stretch_freeze):
+                        ratio = step / stretch_freeze
+                        out.write(cv2.addWeighted(previous_frame, 1.0 - ratio, frame, ratio, 0))
+                out.write(frame)
+                previous_frame = frame
+                print(f"    机位 {cam_id} 转场帧 {i+1}/{len(camera_ids)}", end='\r')
+        else:
+            raise ValueError(f"Unknown freeze interpolation mode: {interpolation_mode}")
 
         print(f"\n  凝结转场完成: 共 {len(camera_ids)} 个视角 × {stretch_freeze}")
 
@@ -343,7 +363,7 @@ class SpacetimeSlicer:
                  stretch_head=1, stretch_ghost=1, stretch_fade=1,
                  stretch_freeze=1, stretch_tail=1,
                  background_mode='freeze', recovery_transition_frames=3,
-                 initial_subject_patch_mode='median'):
+                 initial_subject_patch_mode='median', freeze_interp_mode='rife'):
         """
         生成时空切片视频（残影渐变 → 回收 → 多视角凝结 → 继续播放）
 
@@ -373,6 +393,8 @@ class SpacetimeSlicer:
             raise ValueError("recovery_transition_frames must not be negative")
         if min(stretch_head, stretch_ghost, stretch_fade, stretch_freeze, stretch_tail) < 1:
             raise ValueError("stretch values must be at least 1")
+        if freeze_interp_mode not in ('rife', 'repeat', 'blend'):
+            raise ValueError(f"Unknown freeze interpolation mode: {freeze_interp_mode}")
         start_cam = camera_ids[0]
         end_cam = camera_ids[-1]
         if freeze_idx >= len(self.frame_paths_dict[start_cam]):
@@ -383,7 +405,7 @@ class SpacetimeSlicer:
         if effect_end_idx > len(self.frame_paths_dict[end_cam]):
             raise ValueError(f"Camera {end_cam} does not contain frames up to {effect_end_idx - 1}")
 
-        stretch_suffix = f"_sh{stretch_head}_sg{stretch_ghost}_sfd{stretch_fade}_sfz{stretch_freeze}_st{stretch_tail}_rife_patch{initial_subject_patch_mode}_recoverybg{background_mode}_rt{recovery_transition_frames}"
+        stretch_suffix = f"_sh{stretch_head}_sg{stretch_ghost}_sfd{stretch_fade}_sfz{stretch_freeze}_st{stretch_tail}_rife_fim{freeze_interp_mode}_patch{initial_subject_patch_mode}_recoverybg{background_mode}_rt{recovery_transition_frames}"
         run_name = f"freeze_{start_cam}_to_{end_cam}_seq{len(camera_ids)}_s{effect_start_idx}_f{freeze_idx}_e{effect_end_idx}{stretch_suffix}"
         output_dir = os.path.join(self.output_root, run_name)
         os.makedirs(output_dir, exist_ok=True)
@@ -449,7 +471,13 @@ class SpacetimeSlicer:
 
         # ============ 4. 凝结转场: 多机位环绕 ============
         print(f"\n进入凝结状态，多机位环绕...")
-        self.process_freeze_transition(camera_ids, freeze_idx, out, stretch_freeze=stretch_freeze)
+        self.process_freeze_transition(
+            camera_ids,
+            freeze_idx,
+            out,
+            stretch_freeze=stretch_freeze,
+            interpolation_mode=freeze_interp_mode,
+        )
 
         # ============ 5. 继续播放: 凝结帧之后 -> 结束帧 ============
         if freeze_idx + 1 < effect_end_idx:

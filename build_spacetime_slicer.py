@@ -67,12 +67,21 @@ def build_parser():
     parser.add_argument('--stretch_ghost', type=int, default=1)
     parser.add_argument('--stretch_fade', type=int, default=1)
     parser.add_argument('--stretch_freeze', type=int, default=1)
+    parser.add_argument(
+        '--freeze_interp_mode',
+        default='rife',
+        choices=['rife', 'repeat', 'blend'],
+        help='Freeze orbit: rife=synthesize views, repeat=hold real frames, blend=crossfade real frames',
+    )
     parser.add_argument('--stretch_tail', type=int, default=1)
     parser.add_argument('--background_mode', default='freeze', choices=['median', 'freeze', 'start'])
     parser.add_argument('--initial_subject_patch_mode', default='median', choices=['median', 'freeze'])
     parser.add_argument('--recovery_transition_frames', type=int, default=3)
     parser.add_argument('--rife_exe', help='Path to rife-ncnn-vulkan executable')
-    parser.add_argument('--rife_model_dir', help='Optional rife-ncnn-vulkan model directory')
+    parser.add_argument(
+        '--rife_model_dir',
+        help='Optional RIFE v4 model directory; defaults to rife-v4.6 next to the executable',
+    )
     parser.add_argument('--rife_uhd', action='store_true')
     parser.add_argument('--method', default='RVM',
                         help='RVM, Hybrid, SAM2_BBox, RMBG2, or rembg-<model>')
@@ -86,7 +95,9 @@ def main():
     start_time = time.time()
 
     rife_interpolator = None
-    if args.stretch_ghost > 1 or args.stretch_freeze > 1:
+    if args.stretch_ghost > 1 or (
+        args.freeze_interp_mode == 'rife' and args.stretch_freeze > 1
+    ):
         rife_interpolator = RifeNcnnInterpolator(
             executable=args.rife_exe,
             model_dir=args.rife_model_dir,
@@ -108,6 +119,7 @@ def main():
         print(f'Starting spacetime slicer with {args.method}')
         print(f'Frames: {args.start_frame} -> {args.freeze_frame} -> {end_frame}')
         print(f'RIFE factors: slices={args.stretch_ghost}, freeze_orbit={args.stretch_freeze}')
+        print(f'Freeze orbit interpolation: {args.freeze_interp_mode}')
 
         slicer.generate(
             strategy,
@@ -125,6 +137,7 @@ def main():
             stretch_fade=args.stretch_fade,
             stretch_freeze=args.stretch_freeze,
             stretch_tail=args.stretch_tail,
+            freeze_interp_mode=args.freeze_interp_mode,
             background_mode=args.background_mode,
             recovery_transition_frames=args.recovery_transition_frames,
             initial_subject_patch_mode=args.initial_subject_patch_mode,

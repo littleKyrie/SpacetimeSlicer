@@ -166,6 +166,40 @@ class SpacetimeSlicerTest(unittest.TestCase):
         self.assertEqual(rife.calls, [0.5, 0.5])
         self.assertEqual([int(frame[0, 0, 0]) for frame in out.frames], [0, 50, 100, 150, 200])
 
+    def test_freeze_orbit_repeat_uses_only_real_camera_frames(self):
+        frames = {
+            0: np.zeros((1, 1, 3), dtype=np.uint8),
+            1: np.full((1, 1, 3), 100, dtype=np.uint8),
+            2: np.full((1, 1, 3), 200, dtype=np.uint8),
+        }
+        slicer = SpacetimeSlicer.__new__(SpacetimeSlicer)
+        slicer.rife_interpolator = None
+        slicer.read_frame = lambda idx, camera_id=None: frames[camera_id].copy()
+        out = FrameCollector()
+
+        slicer.process_freeze_transition(
+            [0, 1, 2], 0, out, stretch_freeze=2, interpolation_mode='repeat'
+        )
+
+        self.assertEqual([int(frame[0, 0, 0]) for frame in out.frames], [0, 0, 100, 100, 200, 200])
+
+    def test_freeze_orbit_blend_crossfades_real_camera_frames(self):
+        frames = {
+            0: np.zeros((1, 1, 3), dtype=np.uint8),
+            1: np.full((1, 1, 3), 100, dtype=np.uint8),
+            2: np.full((1, 1, 3), 200, dtype=np.uint8),
+        }
+        slicer = SpacetimeSlicer.__new__(SpacetimeSlicer)
+        slicer.rife_interpolator = None
+        slicer.read_frame = lambda idx, camera_id=None: frames[camera_id].copy()
+        out = FrameCollector()
+
+        slicer.process_freeze_transition(
+            [0, 1, 2], 0, out, stretch_freeze=2, interpolation_mode='blend'
+        )
+
+        self.assertEqual([int(frame[0, 0, 0]) for frame in out.frames], [0, 50, 100, 150, 200])
+
     def test_rife_is_required_for_interpolated_stages(self):
         slicer = SpacetimeSlicer.__new__(SpacetimeSlicer)
         slicer.rife_interpolator = None

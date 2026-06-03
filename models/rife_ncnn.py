@@ -11,7 +11,7 @@ class RifeNcnnInterpolator:
 
     def __init__(self, executable=None, model_dir=None, uhd=False):
         self.executable = self.find_executable(executable)
-        self.model_dir = os.path.abspath(model_dir) if model_dir else None
+        self.model_dir = self.find_timestep_model(model_dir)
         self.uhd = uhd
         self.temp_dir = tempfile.TemporaryDirectory(prefix='spacetime_slicer_rife_')
         self.counter = 0
@@ -21,6 +21,8 @@ class RifeNcnnInterpolator:
         candidates = [
             executable,
             os.environ.get('RIFE_NCNN_EXE'),
+            os.path.join('third_party', 'rife-ncnn-vulkan', 'rife-ncnn-vulkan.exe'),
+            os.path.join('third_party', 'rife-ncnn-vulkan', 'rife-ncnn-vulkan'),
             os.path.join('tools', 'rife-ncnn-vulkan', 'rife-ncnn-vulkan.exe'),
             os.path.join('tools', 'rife-ncnn-vulkan', 'rife-ncnn-vulkan'),
             shutil.which('rife-ncnn-vulkan.exe'),
@@ -31,6 +33,24 @@ class RifeNcnnInterpolator:
                 return os.path.abspath(candidate)
         raise FileNotFoundError(
             'rife-ncnn-vulkan executable not found. Pass --rife_exe or set RIFE_NCNN_EXE.'
+        )
+
+    def find_timestep_model(self, model_dir=None):
+        if model_dir:
+            resolved_model_dir = os.path.abspath(model_dir)
+            if not os.path.isdir(resolved_model_dir):
+                raise FileNotFoundError(f'RIFE model directory not found: {resolved_model_dir}')
+            return resolved_model_dir
+
+        executable_dir = os.path.dirname(self.executable)
+        for model_name in ('rife-v4.6', 'rife-v4'):
+            candidate = os.path.join(executable_dir, model_name)
+            if os.path.isdir(candidate):
+                return candidate
+
+        raise FileNotFoundError(
+            'A RIFE v4 model is required for custom timesteps. '
+            'Pass --rife_model_dir pointing to rife-v4.6 or rife-v4.'
         )
 
     def interpolate(self, first_frame, second_frame, timestep):
@@ -65,7 +85,8 @@ class RifeNcnnInterpolator:
         )
         if result.returncode != 0:
             raise RuntimeError(
-                f'RIFE inference failed ({result.returncode}): {result.stderr.strip()}'
+                f'RIFE inference failed ({result.returncode}) with model {self.model_dir}: '
+                f'{result.stderr.strip()}'
             )
 
         interpolated = cv2.imread(output_path)
