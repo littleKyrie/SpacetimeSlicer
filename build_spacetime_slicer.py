@@ -61,7 +61,7 @@ def build_parser():
     parser.add_argument('--ghost_interval', type=int, default=1)
     parser.add_argument('--edge_feather', type=int, default=0)
     parser.add_argument('--fade_duration_frames', type=int)
-    parser.add_argument('--ghost_opacity_start', type=float, default=0.2)
+    parser.add_argument('--ghost_opacity_start', type=float, default=1.0)
     parser.add_argument('--ghost_opacity_end', type=float, default=1.0)
     parser.add_argument('--stretch_head', type=int, default=1)
     parser.add_argument('--stretch_ghost', type=int, default=1)
@@ -69,7 +69,7 @@ def build_parser():
     parser.add_argument('--stretch_freeze', type=int, default=1)
     parser.add_argument(
         '--freeze_interp_mode',
-        default='rife',
+        default='repeat',
         choices=['rife', 'repeat', 'blend'],
         help='Freeze orbit: rife=synthesize views, repeat=hold real frames, blend=crossfade real frames',
     )

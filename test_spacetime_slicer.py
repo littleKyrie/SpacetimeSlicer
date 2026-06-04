@@ -1,4 +1,6 @@
 import unittest
+import tempfile
+from unittest import mock
 
 import cv2
 import numpy as np
@@ -22,6 +24,18 @@ class ConstantAlphaStrategy:
         return self.alpha.copy()
 
 
+class CameraAwareAlphaStrategy:
+    def __init__(self):
+        self.calls = []
+
+    def process_frame(self, current_frame, current_idx):
+        first_value = int(current_frame[0, 0, 0])
+        self.calls.append((current_idx, first_value))
+        if first_value >= 200:
+            return np.array([[0, 255]], dtype=np.uint8)
+        return np.array([[255, 0]], dtype=np.uint8)
+
+
 class FakeRifeInterpolator:
     def __init__(self):
         self.calls = []
@@ -29,6 +43,21 @@ class FakeRifeInterpolator:
     def interpolate(self, first_frame, second_frame, timestep):
         self.calls.append(timestep)
         return cv2.addWeighted(first_frame, 1.0 - timestep, second_frame, timestep, 0)
+
+
+class FakeVideoWriter:
+    def __init__(self):
+        self.frames = []
+        self.released = False
+
+    def isOpened(self):
+        return True
+
+    def write(self, frame):
+        self.frames.append(frame.copy())
+
+    def release(self):
+        self.released = True
 
 
 def make_slicer(frames, rife_interpolator=None):
@@ -199,6 +228,112 @@ class SpacetimeSlicerTest(unittest.TestCase):
         )
 
         self.assertEqual([int(frame[0, 0, 0]) for frame in out.frames], [0, 50, 100, 150, 200])
+
+    def test_freeze_orbit_carries_created_slices_in_camera_order(self):
+        frames = {
+            (0, 0): np.array([[[10, 10, 10], [11, 11, 11]]], dtype=np.uint8),
+            (0, 1): np.array([[[20, 20, 20], [21, 21, 21]]], dtype=np.uint8),
+            (2, 0): np.array([[[100, 100, 100], [101, 101, 101]]], dtype=np.uint8),
+            (2, 1): np.array([[[200, 200, 200], [201, 201, 201]]], dtype=np.uint8),
+        }
+        slicer = SpacetimeSlicer.__new__(SpacetimeSlicer)
+        slicer.rife_interpolator = None
+        slicer.read_frame = lambda idx, camera_id=None: frames[(idx, camera_id)].copy()
+        out = FrameCollector()
+        strategy = CameraAwareAlphaStrategy()
+        alpha = np.array([[255, 0]], dtype=np.uint8)
+        all_ghosts = [{
+            'frame': frames[(2, 0)].copy(),
+            'alpha': alpha,
+            'source_idx': 2,
+            'camera_id': 0,
+            'opacity': 1.0,
+        }]
+
+        last_frame = slicer.process_freeze_transition(
+            [0, 1], 0, out, interpolation_mode='repeat',
+            all_ghosts=all_ghosts, permanent_indices=[0], strategy=strategy,
+        )
+
+        self.assertEqual([frame[0, :, 0].tolist() for frame in out.frames], [[100, 11], [20, 201]])
+        self.assertEqual(last_frame[0, :, 0].tolist(), [20, 201])
+        self.assertEqual(strategy.calls, [(2, 200)])
+
+    def test_generate_orbits_before_recovery_and_forces_opaque_slices(self):
+        class RecordingSlicer(SpacetimeSlicer):
+            def __init__(self, output_root):
+                self.camera_ids = [0, 1]
+                self.frame_paths_dict = {0: list(range(4)), 1: list(range(4))}
+                self.output_root = output_root
+                self.fps = 25
+                self.rife_interpolator = None
+                self.events = []
+                self.segment_opacity = None
+                self.freeze_ghosts = None
+                self.fade_transition_value = None
+                self.fade_background_value = None
+
+            def read_frame(self, idx, camera_id=None):
+                if camera_id is None:
+                    camera_id = 0
+                return np.full((1, 1, 3), camera_id * 100 + idx, dtype=np.uint8)
+
+            def process_segment(self, strategy, camera_id, start_idx, end_idx, ghost_interval,
+                                edge_feather, all_ghosts, permanent_indices, out, **kwargs):
+                self.events.append('segment')
+                self.segment_opacity = (
+                    kwargs['ghost_opacity_start'],
+                    kwargs['ghost_opacity_end'],
+                )
+                all_ghosts.append({
+                    'frame': np.full((1, 1, 3), 77, dtype=np.uint8),
+                    'alpha': np.full((1, 1), 255, dtype=np.uint8),
+                    'opacity': kwargs['ghost_opacity_start'],
+                })
+                permanent_indices.append(0)
+                return (
+                    np.full((1, 1, 3), 77, dtype=np.uint8),
+                    1,
+                    np.full((1, 1, 3), 78, dtype=np.uint8),
+                )
+
+            def process_freeze_transition(self, camera_ids, freeze_idx, out, **kwargs):
+                self.events.append('freeze')
+                self.freeze_ghosts = (
+                    len(kwargs['all_ghosts']),
+                    list(kwargs['permanent_indices']),
+                    list(camera_ids),
+                )
+                return np.full((1, 1, 3), 88, dtype=np.uint8)
+
+            def process_fade_out(self, out, all_ghosts, permanent_indices, background,
+                                 total_fade_frames, **kwargs):
+                self.events.append('fade')
+                self.fade_transition_value = int(kwargs['transition_from'][0, 0, 0])
+                self.fade_background_value = int(background[0, 0, 0])
+
+        fake_writer = FakeVideoWriter()
+        with tempfile.TemporaryDirectory() as output_root:
+            slicer = RecordingSlicer(output_root)
+            with mock.patch('models.spacetime_slicer.cv2.VideoWriter', return_value=fake_writer), \
+                    mock.patch('models.spacetime_slicer.os.path.isfile', return_value=True), \
+                    mock.patch('models.spacetime_slicer.os.path.getsize', return_value=1):
+                slicer.generate(
+                    ConstantAlphaStrategy(np.full((1, 1), 255, dtype=np.uint8)),
+                    1, 2, 4,
+                    camera_ids=[0, 1],
+                    ghost_opacity_start=0.2,
+                    ghost_opacity_end=0.4,
+                    initial_subject_patch_mode='freeze',
+                    background_mode='freeze',
+                    freeze_interp_mode='repeat',
+                )
+
+        self.assertEqual(slicer.events, ['segment', 'freeze', 'fade'])
+        self.assertEqual(slicer.segment_opacity, (1.0, 1.0))
+        self.assertEqual(slicer.freeze_ghosts, (1, [0], [0, 1]))
+        self.assertEqual(slicer.fade_transition_value, 88)
+        self.assertEqual(slicer.fade_background_value, 102)
 
     def test_rife_is_required_for_interpolated_stages(self):
         slicer = SpacetimeSlicer.__new__(SpacetimeSlicer)

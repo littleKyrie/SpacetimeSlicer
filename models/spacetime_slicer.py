@@ -137,6 +137,12 @@ class SpacetimeSlicer:
         aligned_alpha[dst_y0:dst_y1, dst_x0:dst_x1] = resized_alpha[src_y0:src_y1, src_x0:src_x1]
         return aligned_frame, aligned_alpha
 
+    def apply_edge_feather(self, alpha_mask, edge_feather):
+        if edge_feather < 0:
+            kernel = np.ones((3, 3), np.uint8)
+            return cv2.erode(alpha_mask, kernel, iterations=abs(edge_feather))
+        return alpha_mask
+
     def process_segment(self, strategy, camera_id, start_idx, end_idx, ghost_interval, edge_feather,
                         all_ghosts, permanent_indices, out, initial_canvas=None,
                         initial_subject_replacement=None,
@@ -159,10 +165,7 @@ class SpacetimeSlicer:
         for i in range(start_idx, end_idx):
             current_frame = self.read_frame(i, camera_id)
             alpha_mask = strategy.process_frame(current_frame, i)
-
-            if edge_feather < 0:
-                kernel = np.ones((3, 3), np.uint8)
-                alpha_mask = cv2.erode(alpha_mask, kernel, iterations=abs(edge_feather))
+            alpha_mask = self.apply_edge_feather(alpha_mask, edge_feather)
 
             should_be_ghost = ((i - start_idx) % ghost_interval == 0)
             alpha_normalized = np.repeat(alpha_mask[:, :, np.newaxis], 3, axis=2) / 255.0
@@ -192,6 +195,8 @@ class SpacetimeSlicer:
             all_ghosts.append({
                 'frame': current_frame.copy(),
                 'alpha': alpha_mask.copy(),
+                'source_idx': i,
+                'camera_id': camera_id,
                 'opacity': ghost_opacities[min(ghost_count - 1, len(ghost_opacities) - 1)] if should_be_ghost else 1.0
             })
 
@@ -199,39 +204,109 @@ class SpacetimeSlicer:
 
         return canvas_ghosts, ghost_count, last_frame_output
 
+    def get_ghost_view(self, ghost, camera_id, strategy=None, edge_feather=0):
+        if camera_id is None or ghost.get('camera_id') == camera_id:
+            return ghost
+
+        views = ghost.setdefault('views', {})
+        if camera_id in views:
+            return views[camera_id]
+
+        source_idx = ghost.get('source_idx')
+        if source_idx is None or strategy is None:
+            return ghost
+
+        frame = self.read_frame(source_idx, camera_id)
+        alpha = strategy.process_frame(frame, source_idx)
+        alpha = self.apply_edge_feather(alpha, edge_feather)
+        view = {
+            'frame': frame.copy(),
+            'alpha': alpha.copy(),
+            'source_idx': source_idx,
+            'camera_id': camera_id,
+            'opacity': ghost.get('opacity', 1.0),
+        }
+        views[camera_id] = view
+        return view
+
+    def build_camera_ghosts(self, all_ghosts, camera_id, strategy=None, edge_feather=0):
+        return [
+            self.get_ghost_view(ghost, camera_id, strategy, edge_feather)
+            for ghost in all_ghosts
+        ]
+
+    def compose_static_ghosts(self, all_ghosts, permanent_indices, background,
+                              strategy=None, camera_id=None, edge_feather=0):
+        current_canvas = background.copy()
+        for p_idx in permanent_indices:
+            if p_idx >= len(all_ghosts):
+                continue
+            ghost = self.get_ghost_view(all_ghosts[p_idx], camera_id, strategy, edge_feather)
+            ghost_opacity = ghost.get('opacity', 1.0)
+            ghost_alpha_3ch = np.repeat(
+                ghost['alpha'][:, :, np.newaxis], 3, axis=2
+            ) / 255.0 * ghost_opacity
+            current_canvas = (
+                ghost['frame'] * ghost_alpha_3ch + current_canvas * (1 - ghost_alpha_3ch)
+            ).astype(np.uint8)
+        return current_canvas
+
     def process_freeze_transition(self, camera_ids, freeze_idx, out, stretch_freeze=1,
-                                  interpolation_mode='rife'):
-        """处理凝结转场阶段（回收残影后的多视角环绕）
-        按输入机位顺序输出每个机位在 freeze_idx 的帧，产生多视角效果
+                                  interpolation_mode='rife', all_ghosts=None,
+                                  permanent_indices=None, strategy=None,
+                                  edge_feather=0):
+        """Carry created slices through the freeze orbit in camera-id order.
         """
         print(f"\n处理凝结转场: {len(camera_ids)} 个机位 ({camera_ids[0]} -> {camera_ids[-1]})")
+
+        all_ghosts = all_ghosts or []
+        permanent_indices = permanent_indices or []
+        last_transition_frame = None
+
+        def build_freeze_frame(cam_id):
+            base_frame = self.read_frame(freeze_idx, cam_id)
+            if len(all_ghosts) == 0 or len(permanent_indices) == 0:
+                return base_frame
+            return self.compose_static_ghosts(
+                all_ghosts,
+                permanent_indices,
+                base_frame,
+                strategy=strategy,
+                camera_id=cam_id,
+                edge_feather=edge_feather,
+            )
 
         if interpolation_mode == 'rife':
             stage_writer = self.create_rife_writer(out, stretch_freeze, 0, len(camera_ids) - 1)
             for i, cam_id in enumerate(camera_ids):
-                frame = self.read_frame(freeze_idx, cam_id)
+                frame = build_freeze_frame(cam_id)
                 stage_writer.write(frame, i)
+                last_transition_frame = frame
                 print(f"    机位 {cam_id} 转场帧 {i+1}/{len(camera_ids)}", end='\r')
         elif interpolation_mode == 'repeat':
             for i, cam_id in enumerate(camera_ids):
-                frame = self.read_frame(freeze_idx, cam_id)
+                frame = build_freeze_frame(cam_id)
                 self.write_frame_repeat(out, frame, stretch_freeze)
+                last_transition_frame = frame
                 print(f"    机位 {cam_id} 转场帧 {i+1}/{len(camera_ids)}", end='\r')
         elif interpolation_mode == 'blend':
             previous_frame = None
             for i, cam_id in enumerate(camera_ids):
-                frame = self.read_frame(freeze_idx, cam_id)
+                frame = build_freeze_frame(cam_id)
                 if previous_frame is not None:
                     for step in range(1, stretch_freeze):
                         ratio = step / stretch_freeze
                         out.write(cv2.addWeighted(previous_frame, 1.0 - ratio, frame, ratio, 0))
                 out.write(frame)
                 previous_frame = frame
+                last_transition_frame = frame
                 print(f"    机位 {cam_id} 转场帧 {i+1}/{len(camera_ids)}", end='\r')
         else:
             raise ValueError(f"Unknown freeze interpolation mode: {interpolation_mode}")
 
         print(f"\n  凝结转场完成: 共 {len(camera_ids)} 个视角 × {stretch_freeze}")
+
+        return last_transition_frame
 
     def interpolate_ghost(self, all_ghosts, position):
         lower_idx = int(np.floor(position))
@@ -365,15 +440,13 @@ class SpacetimeSlicer:
                  background_mode='freeze', recovery_transition_frames=3,
                  initial_subject_patch_mode='median', freeze_interp_mode='rife'):
         """
-        生成时空切片视频（残影渐变 → 回收 → 多视角凝结 → 继续播放）
+        生成时空切片视频（切片生成 → 携带切片环绕 → 回收 → 继续播放）
 
         流程:
           1. 片头: 0 -> effect_start_idx（固定机位原样播放）
-          2. 特效段: effect_start_idx -> freeze_idx（残影+透明度渐变）
-             - 第一帧人物 = ghost #0, 直接应用 opacity 作为初始画布
-             - 后续残影线性叠加
-          3. 片尾淡出: 回收所有残影
-          4. 凝结转场: 按 camera_ids 顺序输出各机位 freeze_idx 帧
+          2. 特效段: effect_start_idx -> freeze_idx（按 ghost_interval 生成切片）
+          3. 凝结转场: 按 camera_ids 顺序输出各机位 freeze_idx 帧并携带切片
+          4. 片尾淡出: 环绕结束后回收所有切片
           5. 继续播放: freeze_idx+1 -> effect_end_idx（终止机位原样播放）
         """
         if camera_ids is None:
@@ -427,6 +500,8 @@ class SpacetimeSlicer:
 
         effect_frame_count = freeze_idx - effect_start_idx + 1
         total_fade_frames = self.resolve_fade_duration(effect_frame_count, fade_duration_frames)
+        effective_ghost_opacity_start = 1.0
+        effective_ghost_opacity_end = 1.0
 
         # ============ 1. 写入片头 ============
         print("写入片头...")
@@ -437,7 +512,7 @@ class SpacetimeSlicer:
 
         # ============ 2. 特效段: 固定机位 + 残影 + 透明度渐变 ============
         print(f"\n特效段: 机位 {start_cam} ({effect_start_idx} -> {freeze_idx})")
-        print(f"   残影透明度: {ghost_opacity_start:.0%} -> {ghost_opacity_end:.0%}, 插帧 ×{stretch_ghost}")
+        print(f"   残影透明度: {effective_ghost_opacity_start:.0%} -> {effective_ghost_opacity_end:.0%}, 插帧 ×{stretch_ghost}")
         generation_canvas = self.read_frame(effect_start_idx, start_cam).copy()
         if initial_subject_patch_mode == 'median':
             initial_subject_replacement = self.build_temporal_median_background(start_cam)
@@ -450,34 +525,44 @@ class SpacetimeSlicer:
             ghost_interval, edge_feather, all_ghosts, permanent_indices, out,
             initial_canvas=generation_canvas,
             initial_subject_replacement=initial_subject_replacement,
-            ghost_opacity_start=ghost_opacity_start,
-            ghost_opacity_end=ghost_opacity_end,
+            ghost_opacity_start=effective_ghost_opacity_start,
+            ghost_opacity_end=effective_ghost_opacity_end,
             stretch_ghost=stretch_ghost
         )
 
-        # ============ 3. 片尾淡出: 回收所有残影 ============
-        if background_mode == 'median':
-            fade_background = self.build_temporal_median_background(start_cam)
-        elif background_mode == 'freeze':
-            fade_background = self.read_frame(freeze_idx, start_cam).copy()
-        elif background_mode == 'start':
-            fade_background = generation_canvas
-        else:
-            raise ValueError(f"Unknown background mode: {background_mode}")
-        self.process_fade_out(out, all_ghosts, permanent_indices, fade_background, total_fade_frames,
-                              stretch_fade=stretch_fade,
-                              transition_from=last_effect_frame,
-                              recovery_transition_frames=recovery_transition_frames)
-
-        # ============ 4. 凝结转场: 多机位环绕 ============
+        # ============ 3. 凝结转场: 多机位环绕，携带已经产生的切片 ============
         print(f"\n进入凝结状态，多机位环绕...")
-        self.process_freeze_transition(
+        last_orbit_frame = self.process_freeze_transition(
             camera_ids,
             freeze_idx,
             out,
             stretch_freeze=stretch_freeze,
             interpolation_mode=freeze_interp_mode,
+            all_ghosts=all_ghosts,
+            permanent_indices=permanent_indices,
+            strategy=strategy,
+            edge_feather=edge_feather,
         )
+
+        # ============ 4. 片尾淡出: 环绕后回收所有残影 ============
+        if background_mode == 'median':
+            fade_background = self.build_temporal_median_background(end_cam)
+        elif background_mode == 'freeze':
+            fade_background = self.read_frame(freeze_idx, end_cam).copy()
+        elif background_mode == 'start':
+            fade_background = self.read_frame(effect_start_idx, end_cam).copy()
+        else:
+            raise ValueError(f"Unknown background mode: {background_mode}")
+        fade_ghosts = self.build_camera_ghosts(
+            all_ghosts,
+            end_cam,
+            strategy=strategy,
+            edge_feather=edge_feather,
+        )
+        self.process_fade_out(out, fade_ghosts, permanent_indices, fade_background, total_fade_frames,
+                              stretch_fade=stretch_fade,
+                              transition_from=last_orbit_frame,
+                              recovery_transition_frames=recovery_transition_frames)
 
         # ============ 5. 继续播放: 凝结帧之后 -> 结束帧 ============
         if freeze_idx + 1 < effect_end_idx:
@@ -493,7 +578,7 @@ class SpacetimeSlicer:
             raise RuntimeError(f"Video writer did not create a valid output file: {video_path}")
         print(f"\n视频已输出！保存在: {video_path}")
         print(f"   残影: ghost_interval={ghost_interval}, 共 {ghost_count} 个, "
-              f"透明度 {ghost_opacity_start:.0%}->{ghost_opacity_end:.0%}")
+              f"透明度 {effective_ghost_opacity_start:.0%}->{effective_ghost_opacity_end:.0%}")
         print(f"   片尾淡出: {total_fade_frames} 帧 ×{stretch_fade}")
         print(f"   凝结转场: {len(camera_ids)} 个机位视角 ×{stretch_freeze}")
         if freeze_idx + 1 < effect_end_idx:
