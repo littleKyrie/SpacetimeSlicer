@@ -60,6 +60,18 @@ def build_parser():
     parser.add_argument('--end_frame', type=int, required=True, help='End frame of the input video (exclusive and its id should be +1 to corresponds to the actual subdir id)')
     parser.add_argument('--ghost_interval', type=int, default=1)
     parser.add_argument('--edge_feather', type=int, default=0)
+    parser.add_argument(
+        '--cutout_alpha_threshold',
+        type=int,
+        default=128,
+        help='Alpha threshold for opaque cutout compositing; raise to remove dark fringes, lower to keep more hair/detail.',
+    )
+    parser.add_argument(
+        '--cutout_edge_blur',
+        type=int,
+        default=1,
+        help='Small matte blur radius for cutout anti-aliasing; set 0 for a hard binary edge.',
+    )
     parser.add_argument('--fade_duration_frames', type=int)
     parser.add_argument('--ghost_opacity_start', type=float, default=1.0)
     parser.add_argument('--ghost_opacity_end', type=float, default=1.0)
@@ -129,6 +141,8 @@ def main():
             camera_ids=camera_ids,
             ghost_interval=args.ghost_interval,
             edge_feather=args.edge_feather,
+            cutout_alpha_threshold=args.cutout_alpha_threshold,
+            cutout_edge_blur=args.cutout_edge_blur,
             fade_duration_frames=args.fade_duration_frames,
             ghost_opacity_start=args.ghost_opacity_start,
             ghost_opacity_end=args.ghost_opacity_end,

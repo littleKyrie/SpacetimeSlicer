@@ -143,14 +143,33 @@ class SpacetimeSlicer:
             return cv2.erode(alpha_mask, kernel, iterations=abs(edge_feather))
         return alpha_mask
 
+    def build_cutout_matte(self, alpha_mask, alpha_threshold=128, edge_blur=1):
+        matte = (alpha_mask >= alpha_threshold).astype(np.float32)
+        if edge_blur > 0:
+            kernel_size = edge_blur * 2 + 1
+            matte = cv2.GaussianBlur(matte, (kernel_size, kernel_size), 0)
+        return np.clip(matte, 0.0, 1.0)[:, :, np.newaxis]
+
+    def compose_opaque_cutout(self, canvas, frame, alpha_mask, alpha_threshold=128, edge_blur=1):
+        matte = self.build_cutout_matte(alpha_mask, alpha_threshold, edge_blur)
+        if edge_blur <= 0:
+            return np.where(matte >= 0.5, frame, canvas).astype(np.uint8)
+        composed = frame.astype(np.float32) * matte + canvas.astype(np.float32) * (1.0 - matte)
+        return np.clip(composed, 0, 255).astype(np.uint8)
+
+    def sorted_permanent_indices(self, all_ghosts, permanent_indices):
+        return sorted(
+            permanent_indices,
+            key=lambda idx: all_ghosts[idx].get('source_idx', idx) if idx < len(all_ghosts) else idx,
+        )
+
     def process_segment(self, strategy, camera_id, start_idx, end_idx, ghost_interval, edge_feather,
                         all_ghosts, permanent_indices, out, initial_canvas=None,
                         initial_subject_replacement=None,
                         ghost_opacity_start=0.2, ghost_opacity_end=1.0,
-                        stretch_ghost=1):
-        """Accumulate translucent ghosts while keeping the current subject fully visible."""
-        num_ghosts_expected = max(1, ((end_idx - 1 - start_idx) // ghost_interval) + 1)
-        ghost_opacities = np.linspace(ghost_opacity_start, ghost_opacity_end, num_ghosts_expected)
+                        stretch_ghost=1, cutout_alpha_threshold=128,
+                        cutout_edge_blur=1):
+        """Accumulate opaque slices while keeping the current subject on top."""
 
         # A clean initial canvas prevents the first source-frame subject from surviving recovery.
         if initial_canvas is not None:
@@ -168,26 +187,26 @@ class SpacetimeSlicer:
             alpha_mask = self.apply_edge_feather(alpha_mask, edge_feather)
 
             should_be_ghost = ((i - start_idx) % ghost_interval == 0)
-            alpha_normalized = np.repeat(alpha_mask[:, :, np.newaxis], 3, axis=2) / 255.0
 
             if i == start_idx and initial_subject_replacement is not None:
-                canvas_ghosts = (
-                    canvas_ghosts * (1 - alpha_normalized) +
-                    initial_subject_replacement * alpha_normalized
-                ).astype(np.uint8)
+                canvas_ghosts = self.compose_opaque_cutout(
+                    canvas_ghosts, initial_subject_replacement, alpha_mask,
+                    cutout_alpha_threshold, cutout_edge_blur,
+                )
 
             if should_be_ghost:
-                g_opacity = ghost_opacities[min(ghost_count, len(ghost_opacities) - 1)]
-                # Apply opacity to the complete alpha-over operation.
-                ghost_alpha = alpha_normalized * g_opacity
-                canvas_ghosts = (current_frame * ghost_alpha +
-                                 canvas_ghosts * (1 - ghost_alpha)).astype(np.uint8)
+                canvas_ghosts = self.compose_opaque_cutout(
+                    canvas_ghosts, current_frame, alpha_mask,
+                    cutout_alpha_threshold, cutout_edge_blur,
+                )
                 ghost_count += 1
                 permanent_indices.append(len(all_ghosts))
 
             # 输出帧：完整人物叠加到残影画布上（所有帧人物都 100% 显示，无闪烁）
-            frame_output = (current_frame * alpha_normalized +
-                            canvas_ghosts * (1 - alpha_normalized)).astype(np.uint8)
+            frame_output = self.compose_opaque_cutout(
+                canvas_ghosts, current_frame, alpha_mask,
+                cutout_alpha_threshold, cutout_edge_blur,
+            )
             last_frame_output = frame_output
 
             stage_writer.write(frame_output, i)
@@ -197,7 +216,7 @@ class SpacetimeSlicer:
                 'alpha': alpha_mask.copy(),
                 'source_idx': i,
                 'camera_id': camera_id,
-                'opacity': ghost_opacities[min(ghost_count - 1, len(ghost_opacities) - 1)] if should_be_ghost else 1.0
+                'opacity': 1.0,
             })
 
             print(f"  > 机位 {camera_id} 渲染特效帧: {i}/{end_idx-1} (已累积 {ghost_count} 个残影)", end='\r')
@@ -236,25 +255,24 @@ class SpacetimeSlicer:
         ]
 
     def compose_static_ghosts(self, all_ghosts, permanent_indices, background,
-                              strategy=None, camera_id=None, edge_feather=0):
+                              strategy=None, camera_id=None, edge_feather=0,
+                              cutout_alpha_threshold=128, cutout_edge_blur=1):
         current_canvas = background.copy()
-        for p_idx in permanent_indices:
+        for p_idx in self.sorted_permanent_indices(all_ghosts, permanent_indices):
             if p_idx >= len(all_ghosts):
                 continue
             ghost = self.get_ghost_view(all_ghosts[p_idx], camera_id, strategy, edge_feather)
-            ghost_opacity = ghost.get('opacity', 1.0)
-            ghost_alpha_3ch = np.repeat(
-                ghost['alpha'][:, :, np.newaxis], 3, axis=2
-            ) / 255.0 * ghost_opacity
-            current_canvas = (
-                ghost['frame'] * ghost_alpha_3ch + current_canvas * (1 - ghost_alpha_3ch)
-            ).astype(np.uint8)
+            current_canvas = self.compose_opaque_cutout(
+                current_canvas, ghost['frame'], ghost['alpha'],
+                cutout_alpha_threshold, cutout_edge_blur,
+            )
         return current_canvas
 
     def process_freeze_transition(self, camera_ids, freeze_idx, out, stretch_freeze=1,
                                   interpolation_mode='rife', all_ghosts=None,
                                   permanent_indices=None, strategy=None,
-                                  edge_feather=0):
+                                  edge_feather=0, cutout_alpha_threshold=128,
+                                  cutout_edge_blur=1):
         """Carry created slices through the freeze orbit in camera-id order.
         """
         print(f"\n处理凝结转场: {len(camera_ids)} 个机位 ({camera_ids[0]} -> {camera_ids[-1]})")
@@ -267,13 +285,23 @@ class SpacetimeSlicer:
             base_frame = self.read_frame(freeze_idx, cam_id)
             if len(all_ghosts) == 0 or len(permanent_indices) == 0:
                 return base_frame
-            return self.compose_static_ghosts(
+            frame_with_slices = self.compose_static_ghosts(
                 all_ghosts,
                 permanent_indices,
                 base_frame,
                 strategy=strategy,
                 camera_id=cam_id,
                 edge_feather=edge_feather,
+                cutout_alpha_threshold=cutout_alpha_threshold,
+                cutout_edge_blur=cutout_edge_blur,
+            )
+            if strategy is None:
+                return frame_with_slices
+            freeze_alpha = strategy.process_frame(base_frame, freeze_idx)
+            freeze_alpha = self.apply_edge_feather(freeze_alpha, edge_feather)
+            return self.compose_opaque_cutout(
+                frame_with_slices, base_frame, freeze_alpha,
+                cutout_alpha_threshold, cutout_edge_blur,
             )
 
         if interpolation_mode == 'rife':
@@ -364,20 +392,17 @@ class SpacetimeSlicer:
         return trajectories
 
     def compose_recovery_frame(self, all_ghosts, permanent_indices, ghost_trajectories, background,
-                               frame_offset):
+                               frame_offset, cutout_alpha_threshold=128, cutout_edge_blur=1):
         current_canvas = background.copy()
-        for p_idx in permanent_indices:
+        for p_idx in self.sorted_permanent_indices(all_ghosts, permanent_indices):
             trajectory = ghost_trajectories.get(p_idx)
             if trajectory is None:
                 continue
             ghost = self.interpolate_ghost(all_ghosts, trajectory[frame_offset])
-            ghost_opacity = all_ghosts[p_idx].get('opacity', 1.0)
-            ghost_alpha_3ch = np.repeat(
-                ghost['alpha'][:, :, np.newaxis], 3, axis=2
-            ) / 255.0 * ghost_opacity
-            current_canvas = (
-                ghost['frame'] * ghost_alpha_3ch + current_canvas * (1 - ghost_alpha_3ch)
-            ).astype(np.uint8)
+            current_canvas = self.compose_opaque_cutout(
+                current_canvas, ghost['frame'], ghost['alpha'],
+                cutout_alpha_threshold, cutout_edge_blur,
+            )
         return current_canvas
 
     def write_canvas_transition(self, out, first_frame, second_frame, transition_frames):
@@ -387,7 +412,8 @@ class SpacetimeSlicer:
             out.write(cv2.addWeighted(first_frame, 1.0 - ratio, second_frame, ratio, 0))
 
     def process_fade_out(self, out, all_ghosts, permanent_indices, background, total_fade_frames,
-                         stretch_fade=1, transition_from=None, recovery_transition_frames=0):
+                         stretch_fade=1, transition_from=None, recovery_transition_frames=0,
+                         cutout_alpha_threshold=128, cutout_edge_blur=1):
         """处理片尾淡出（应用残影透明度渐变，保留原残影的透明度）"""
         output_fade_frames = total_fade_frames * max(1, stretch_fade)
         print(f"\n写入片尾（定格 + 残影回收消失）...")
@@ -417,7 +443,9 @@ class SpacetimeSlicer:
             return
 
         first_recovery_frame = self.compose_recovery_frame(
-            all_ghosts, permanent_indices, ghost_trajectories, background, 0
+            all_ghosts, permanent_indices, ghost_trajectories, background, 0,
+            cutout_alpha_threshold=cutout_alpha_threshold,
+            cutout_edge_blur=cutout_edge_blur,
         )
         if transition_from is not None:
             self.write_canvas_transition(
@@ -426,7 +454,9 @@ class SpacetimeSlicer:
 
         for frame_offset in range(output_fade_frames):
             current_canvas = self.compose_recovery_frame(
-                all_ghosts, permanent_indices, ghost_trajectories, background, frame_offset
+                all_ghosts, permanent_indices, ghost_trajectories, background, frame_offset,
+                cutout_alpha_threshold=cutout_alpha_threshold,
+                cutout_edge_blur=cutout_edge_blur,
             )
             out.write(current_canvas)
             print(f"  > 消失进度: {frame_offset+1}/{output_fade_frames}", end='\r')
@@ -438,7 +468,8 @@ class SpacetimeSlicer:
                  stretch_head=1, stretch_ghost=1, stretch_fade=1,
                  stretch_freeze=1, stretch_tail=1,
                  background_mode='freeze', recovery_transition_frames=3,
-                 initial_subject_patch_mode='median', freeze_interp_mode='rife'):
+                 initial_subject_patch_mode='median', freeze_interp_mode='rife',
+                 cutout_alpha_threshold=128, cutout_edge_blur=1):
         """
         生成时空切片视频（切片生成 → 携带切片环绕 → 回收 → 继续播放）
 
@@ -464,6 +495,10 @@ class SpacetimeSlicer:
             raise ValueError("fade_duration_frames must be at least 1")
         if recovery_transition_frames < 0:
             raise ValueError("recovery_transition_frames must not be negative")
+        if not 0 <= cutout_alpha_threshold <= 255:
+            raise ValueError("cutout_alpha_threshold must be between 0 and 255")
+        if cutout_edge_blur < 0:
+            raise ValueError("cutout_edge_blur must not be negative")
         if min(stretch_head, stretch_ghost, stretch_fade, stretch_freeze, stretch_tail) < 1:
             raise ValueError("stretch values must be at least 1")
         if freeze_interp_mode not in ('rife', 'repeat', 'blend'):
@@ -500,9 +535,6 @@ class SpacetimeSlicer:
 
         effect_frame_count = freeze_idx - effect_start_idx + 1
         total_fade_frames = self.resolve_fade_duration(effect_frame_count, fade_duration_frames)
-        effective_ghost_opacity_start = 1.0
-        effective_ghost_opacity_end = 1.0
-
         # ============ 1. 写入片头 ============
         print("写入片头...")
         for i in range(0, effect_start_idx):
@@ -512,7 +544,7 @@ class SpacetimeSlicer:
 
         # ============ 2. 特效段: 固定机位 + 残影 + 透明度渐变 ============
         print(f"\n特效段: 机位 {start_cam} ({effect_start_idx} -> {freeze_idx})")
-        print(f"   残影透明度: {effective_ghost_opacity_start:.0%} -> {effective_ghost_opacity_end:.0%}, 插帧 ×{stretch_ghost}")
+        print(f"   切片不透明叠加, 插帧 ×{stretch_ghost}")
         generation_canvas = self.read_frame(effect_start_idx, start_cam).copy()
         if initial_subject_patch_mode == 'median':
             initial_subject_replacement = self.build_temporal_median_background(start_cam)
@@ -525,9 +557,11 @@ class SpacetimeSlicer:
             ghost_interval, edge_feather, all_ghosts, permanent_indices, out,
             initial_canvas=generation_canvas,
             initial_subject_replacement=initial_subject_replacement,
-            ghost_opacity_start=effective_ghost_opacity_start,
-            ghost_opacity_end=effective_ghost_opacity_end,
-            stretch_ghost=stretch_ghost
+            ghost_opacity_start=1.0,
+            ghost_opacity_end=1.0,
+            stretch_ghost=stretch_ghost,
+            cutout_alpha_threshold=cutout_alpha_threshold,
+            cutout_edge_blur=cutout_edge_blur,
         )
 
         # ============ 3. 凝结转场: 多机位环绕，携带已经产生的切片 ============
@@ -542,6 +576,8 @@ class SpacetimeSlicer:
             permanent_indices=permanent_indices,
             strategy=strategy,
             edge_feather=edge_feather,
+            cutout_alpha_threshold=cutout_alpha_threshold,
+            cutout_edge_blur=cutout_edge_blur,
         )
 
         # ============ 4. 片尾淡出: 环绕后回收所有残影 ============
@@ -562,7 +598,9 @@ class SpacetimeSlicer:
         self.process_fade_out(out, fade_ghosts, permanent_indices, fade_background, total_fade_frames,
                               stretch_fade=stretch_fade,
                               transition_from=last_orbit_frame,
-                              recovery_transition_frames=recovery_transition_frames)
+                              recovery_transition_frames=recovery_transition_frames,
+                              cutout_alpha_threshold=cutout_alpha_threshold,
+                              cutout_edge_blur=cutout_edge_blur)
 
         # ============ 5. 继续播放: 凝结帧之后 -> 结束帧 ============
         if freeze_idx + 1 < effect_end_idx:
@@ -577,8 +615,7 @@ class SpacetimeSlicer:
         if not os.path.isfile(video_path) or os.path.getsize(video_path) == 0:
             raise RuntimeError(f"Video writer did not create a valid output file: {video_path}")
         print(f"\n视频已输出！保存在: {video_path}")
-        print(f"   残影: ghost_interval={ghost_interval}, 共 {ghost_count} 个, "
-              f"透明度 {effective_ghost_opacity_start:.0%}->{effective_ghost_opacity_end:.0%}")
+        print(f"   残影: ghost_interval={ghost_interval}, 共 {ghost_count} 个, 切片不透明")
         print(f"   片尾淡出: {total_fade_frames} 帧 ×{stretch_fade}")
         print(f"   凝结转场: {len(camera_ids)} 个机位视角 ×{stretch_freeze}")
         if freeze_idx + 1 < effect_end_idx:

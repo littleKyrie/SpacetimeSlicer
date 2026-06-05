@@ -1,0 +1,13 @@
+python build_spacetime_slicer.py 
+--input_dir ./data/123/2026-05-31-144347 
+--output_dir ./results/2026-05-31-144347/test1 
+--camera_ids 25,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,41,42,43,44,45,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24 
+--start_frame 30 
+--freeze_frame 50 
+--end_frame 61 
+--ghost_interval 5 
+--fade_duration_frames 25 
+--stretch_ghost 3 
+--stretch_freeze 2 
+--rife_exe ./third_party/rife-ncnn-vulkan/rife-ncnn-vulkan.exe 
+--rife_model_dir ./third_party/rife-ncnn-vulkan/rife-v4.6

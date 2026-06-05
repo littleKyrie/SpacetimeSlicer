@@ -71,7 +71,7 @@ def make_slicer(frames, rife_interpolator=None):
 
 
 class SpacetimeSlicerTest(unittest.TestCase):
-    def test_segment_blends_ghost_with_effective_alpha(self):
+    def test_segment_composes_opaque_slices(self):
         frames = [
             np.full((1, 1, 3), 100, dtype=np.uint8),
             np.full((1, 1, 3), 200, dtype=np.uint8),
@@ -87,12 +87,13 @@ class SpacetimeSlicerTest(unittest.TestCase):
             initial_subject_replacement=np.zeros((1, 1, 3), dtype=np.uint8),
             ghost_opacity_start=0.25,
             ghost_opacity_end=0.25,
+            cutout_edge_blur=0,
         )
 
         self.assertEqual(ghost_count, 2)
         self.assertEqual(permanent_indices, [0, 1])
         self.assertTrue(np.array_equal(last_effect_frame, np.full((1, 1, 3), 200, dtype=np.uint8)))
-        self.assertTrue(np.array_equal(canvas, np.full((1, 1, 3), 68, dtype=np.uint8)))
+        self.assertTrue(np.array_equal(canvas, np.full((1, 1, 3), 200, dtype=np.uint8)))
 
     def test_initial_subject_patch_keeps_background_pixels(self):
         frames = [np.array([[[100, 100, 100], [50, 50, 50]]], dtype=np.uint8)]
@@ -105,9 +106,10 @@ class SpacetimeSlicerTest(unittest.TestCase):
             initial_subject_replacement=np.zeros((1, 2, 3), dtype=np.uint8),
             ghost_opacity_start=0.25,
             ghost_opacity_end=0.25,
+            cutout_edge_blur=0,
         )
 
-        self.assertTrue(np.array_equal(canvas[0, 0], np.full(3, 25, dtype=np.uint8)))
+        self.assertTrue(np.array_equal(canvas[0, 0], np.full(3, 100, dtype=np.uint8)))
         self.assertTrue(np.array_equal(canvas[0, 1], np.full(3, 50, dtype=np.uint8)))
 
     def test_recovery_trajectory_uses_fractional_smoothstep_positions(self):
@@ -117,7 +119,7 @@ class SpacetimeSlicerTest(unittest.TestCase):
 
         self.assertEqual(trajectories[0], [0.0, 0.3125, 1.0, 1.6875, 2.0])
 
-    def test_recovery_keeps_created_ghost_opacity_while_moving(self):
+    def test_recovery_composes_opaque_slices_while_moving(self):
         slicer = SpacetimeSlicer.__new__(SpacetimeSlicer)
         alpha = np.full((1, 1), 255, dtype=np.uint8)
         all_ghosts = [
@@ -129,7 +131,7 @@ class SpacetimeSlicerTest(unittest.TestCase):
 
         slicer.process_fade_out(out, all_ghosts, [0], np.zeros((1, 1, 3), dtype=np.uint8), 3)
 
-        self.assertEqual([int(frame[0, 0, 0]) for frame in out.frames], [25, 50, 60])
+        self.assertEqual([int(frame[0, 0, 0]) for frame in out.frames], [100, 200, 240])
 
     def test_recovery_cutout_aligns_subject_before_blending(self):
         slicer = SpacetimeSlicer.__new__(SpacetimeSlicer)
@@ -173,6 +175,7 @@ class SpacetimeSlicerTest(unittest.TestCase):
             initial_canvas=frames[0],
             initial_subject_replacement=np.zeros((1, 1, 3), dtype=np.uint8),
             stretch_ghost=3,
+            cutout_edge_blur=0,
         )
 
         self.assertEqual(rife.calls, [1 / 3, 2 / 3])
@@ -253,11 +256,39 @@ class SpacetimeSlicerTest(unittest.TestCase):
         last_frame = slicer.process_freeze_transition(
             [0, 1], 0, out, interpolation_mode='repeat',
             all_ghosts=all_ghosts, permanent_indices=[0], strategy=strategy,
+            cutout_edge_blur=0,
         )
 
-        self.assertEqual([frame[0, :, 0].tolist() for frame in out.frames], [[100, 11], [20, 201]])
+        self.assertEqual([frame[0, :, 0].tolist() for frame in out.frames], [[10, 11], [20, 201]])
         self.assertEqual(last_frame[0, :, 0].tolist(), [20, 201])
-        self.assertEqual(strategy.calls, [(2, 200)])
+        self.assertEqual(strategy.calls, [(0, 10), (2, 200), (0, 20)])
+
+    def test_later_slices_are_composited_above_earlier_slices(self):
+        slicer = SpacetimeSlicer.__new__(SpacetimeSlicer)
+        alpha = np.full((1, 1), 255, dtype=np.uint8)
+        all_ghosts = [
+            {'frame': np.full((1, 1, 3), 100, dtype=np.uint8), 'alpha': alpha, 'source_idx': 1},
+            {'frame': np.full((1, 1, 3), 200, dtype=np.uint8), 'alpha': alpha, 'source_idx': 2},
+        ]
+
+        canvas = slicer.compose_static_ghosts(
+            all_ghosts, [1, 0], np.zeros((1, 1, 3), dtype=np.uint8),
+            cutout_edge_blur=0,
+        )
+
+        self.assertEqual(int(canvas[0, 0, 0]), 200)
+
+    def test_low_alpha_dark_fringe_is_removed_from_cutout(self):
+        slicer = SpacetimeSlicer.__new__(SpacetimeSlicer)
+        canvas = np.full((1, 2, 3), 255, dtype=np.uint8)
+        frame = np.array([[[100, 100, 100], [0, 0, 0]]], dtype=np.uint8)
+        alpha = np.array([[255, 32]], dtype=np.uint8)
+
+        out = slicer.compose_opaque_cutout(
+            canvas, frame, alpha, alpha_threshold=128, edge_blur=0
+        )
+
+        self.assertEqual(out[0, :, 0].tolist(), [100, 255])
 
     def test_generate_orbits_before_recovery_and_forces_opaque_slices(self):
         class RecordingSlicer(SpacetimeSlicer):
