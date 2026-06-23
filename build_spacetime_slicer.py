@@ -1,4 +1,5 @@
 import argparse
+import os
 import time
 
 import cv2
@@ -16,6 +17,11 @@ def parse_camera_ids(value):
     if ',' in value:
         return list(map(int, value.split(',')))
     return [int(value)]
+
+
+def parse_frame_ids(value):
+    """Parse comma-separated frame IDs or an inclusive colon range."""
+    return parse_camera_ids(value)
 
 
 def create_strategy(method, slicer, camera_ids):
@@ -49,6 +55,97 @@ def create_strategy(method, slicer, camera_ids):
     raise ValueError(f'Unknown method: {method}')
 
 
+def save_debug_extractions(strategy, slicer, args, camera_ids, end_frame):
+    debug_frames = parse_frame_ids(args.debug_extract_frames)
+    debug_camera = args.debug_extract_camera
+    if debug_camera is None:
+        debug_camera = camera_ids[0]
+
+    slice_end_idx, _ = slicer.resolve_effect_schedule(
+        args.start_frame,
+        args.freeze_frame,
+        args.fade_duration_frames,
+    )
+    ghost_frames = list(range(args.start_frame, slice_end_idx + 1, args.ghost_interval))
+    ghost_opacities = np.linspace(
+        args.ghost_opacity_start,
+        args.ghost_opacity_end,
+        max(1, len(ghost_frames)),
+    )
+    ghost_opacity_by_frame = {
+        frame_idx: float(ghost_opacities[pos])
+        for pos, frame_idx in enumerate(ghost_frames)
+    }
+
+    output_dir = os.path.join(
+        args.output_dir,
+        'debug_extractions',
+        f'cam{debug_camera:03d}_s{args.start_frame}_f{args.freeze_frame}_e{end_frame}',
+    )
+    os.makedirs(output_dir, exist_ok=True)
+
+    print(f'Debug extraction output: {output_dir}')
+    print(f'Slice capture frames: {ghost_frames}')
+
+    for frame_idx in debug_frames:
+        frame = slicer.read_frame(frame_idx, debug_camera)
+        if frame is None:
+            raise ValueError(f'Could not read frame {frame_idx} for camera {debug_camera}')
+
+        alpha_mask = strategy.process_frame(frame, frame_idx)
+        if args.edge_feather < 0:
+            kernel = np.ones((3, 3), np.uint8)
+            alpha_mask = cv2.erode(alpha_mask, kernel, iterations=abs(args.edge_feather))
+
+        ghost_opacity = ghost_opacity_by_frame.get(frame_idx)
+        if ghost_opacity is None:
+            ghost_opacity = 0.0
+            is_slice_frame = False
+        else:
+            is_slice_frame = True
+
+        ghost_alpha = np.clip(
+            alpha_mask.astype(np.float32) * ghost_opacity,
+            0,
+            255,
+        ).astype(np.uint8)
+        patch_mask = np.where(
+            alpha_mask > args.initial_patch_alpha_threshold,
+            255,
+            0,
+        ).astype(np.uint8)
+        if args.initial_patch_dilate > 0:
+            kernel = np.ones((3, 3), np.uint8)
+            patch_mask = cv2.dilate(patch_mask, kernel, iterations=args.initial_patch_dilate)
+        prefix = os.path.join(output_dir, f'frame{frame_idx:04d}_cam{debug_camera:03d}')
+        cv2.imwrite(f'{prefix}_source.jpg', frame)
+        cv2.imwrite(f'{prefix}_rvm_alpha.png', alpha_mask)
+        cv2.imwrite(
+            f'{prefix}_initial_patch_mask_t{args.initial_patch_alpha_threshold}_d{args.initial_patch_dilate}.png',
+            patch_mask,
+        )
+        raw_rgba = cv2.cvtColor(frame, cv2.COLOR_BGR2BGRA)
+        raw_rgba[:, :, 3] = alpha_mask
+        cv2.imwrite(f'{prefix}_rvm_cutout_rgba.png', raw_rgba)
+
+        ghost_rgba = cv2.cvtColor(frame, cv2.COLOR_BGR2BGRA)
+        ghost_rgba[:, :, 3] = ghost_alpha
+        cv2.imwrite(f'{prefix}_slice_rgba_opacity{ghost_opacity:.3f}.png', ghost_rgba)
+
+        alpha_3ch = np.repeat((ghost_alpha.astype(np.float32) / 255.0)[:, :, np.newaxis], 3, axis=2)
+        preview_black = (frame.astype(np.float32) * alpha_3ch).astype(np.uint8)
+        cv2.imwrite(f'{prefix}_slice_preview_on_black.jpg', preview_black)
+
+        alpha_values = alpha_mask.reshape(-1)
+        print(
+            f'Frame {frame_idx} cam {debug_camera}: '
+            f'is_slice={is_slice_frame}, ghost_opacity={ghost_opacity:.3f}, '
+            f'alpha min={int(alpha_values.min())}, max={int(alpha_values.max())}, '
+            f'mean={float(alpha_values.mean()):.2f}, '
+            f'pixels>240={int((alpha_values > 240).sum())}'
+        )
+
+
 def build_parser():
     parser = argparse.ArgumentParser(description='Spacetime Slicer')
     parser.add_argument('--input_dir', required=True)
@@ -56,13 +153,23 @@ def build_parser():
     parser.add_argument('--camera_ids', default='0', help='Comma-separated IDs or inclusive range, such as 0:30 (its id corresponds to the actual file id in the subdir)')
     parser.add_argument('--fps', type=int, default=25, help='FPS of the output video')
     parser.add_argument('--start_frame', type=int, default=0, help='Start frame of the ghost effects (inclusive and its id should be +1 to corresponds to the actual subdir id)')
-    parser.add_argument('--freeze_frame', type=int, required=True, help='Frame to freeze and end all ghost effects (inclusive and its id should be +1 to corresponds to the actual subdir id)')
+    parser.add_argument('--freeze_frame', type=int, required=True, help='Frame where slice recovery is complete and the multi-camera freeze orbit begins (inclusive; its id should be +1 to correspond to the actual subdir id)')
     parser.add_argument('--end_frame', type=int, required=True, help='End frame of the input video (exclusive and its id should be +1 to corresponds to the actual subdir id)')
     parser.add_argument('--ghost_interval', type=int, default=1)
     parser.add_argument('--edge_feather', type=int, default=0)
-    parser.add_argument('--fade_duration_frames', type=int)
+    parser.add_argument('--fade_duration_frames', type=int, help='Recovery duration before --freeze_frame; defaults to about half a second')
     parser.add_argument('--ghost_opacity_start', type=float, default=0.2)
     parser.add_argument('--ghost_opacity_end', type=float, default=1.0)
+    parser.add_argument('--initial_subject_patch_mode', default='freeze', choices=['none', 'median', 'freeze', 'frame'], help='Background source for removing the start-frame subject before overlaying the first translucent slice')
+    parser.add_argument('--initial_subject_patch_frame', type=int, help='Manual frame index used when --initial_subject_patch_mode frame; defaults to --freeze_frame')
+    parser.add_argument('--initial_canvas_mode', default='patched_start', choices=['patched_start', 'clean'], help='Initial canvas for patched_canvas mode: patched_start uses start_frame with the subject region replaced; clean starts from the replacement frame')
+    parser.add_argument('--initial_patch_alpha_threshold', type=int, default=1, help='Alpha threshold used to remove the start-frame subject from the first output frame')
+    parser.add_argument('--initial_patch_dilate', type=int, default=1, help='Dilate the start-frame subject patch mask to remove edge residue')
+    parser.add_argument('--live_subject_alpha_threshold', type=int, default=16, help='Alpha threshold for keeping the current live subject opaque in patched_canvas mode')
+    parser.add_argument('--live_subject_opacity', type=float, default=1.0, help='Opacity of the current live subject in patched_canvas mode')
+    parser.add_argument('--effect_base_mode', default='patched_canvas', choices=['patched_canvas', 'source'], help='patched_canvas mattes the current subject every frame; source uses each original frame as the base and only mattes slice frames')
+    parser.add_argument('--debug_extract_frames', help='Write RVM alpha/cutout diagnostics for comma-separated frames or an inclusive range, then exit')
+    parser.add_argument('--debug_extract_camera', type=int, help='Camera ID for --debug_extract_frames; defaults to the first --camera_ids entry')
     parser.add_argument('--stretch_head', type=int, default=1)
     parser.add_argument('--stretch_ghost', type=int, default=1)
     parser.add_argument('--stretch_fade', type=int, default=1)
@@ -75,7 +182,6 @@ def build_parser():
     )
     parser.add_argument('--stretch_tail', type=int, default=1)
     parser.add_argument('--background_mode', default='freeze', choices=['median', 'freeze', 'start'])
-    parser.add_argument('--initial_subject_patch_mode', default='median', choices=['median', 'freeze'])
     parser.add_argument('--recovery_transition_frames', type=int, default=3)
     parser.add_argument('--rife_exe', help='Path to rife-ncnn-vulkan executable')
     parser.add_argument(
@@ -89,10 +195,10 @@ def build_parser():
 
 
 def main():
+    start_time = time.time()
     args = build_parser().parse_args()
     camera_ids = parse_camera_ids(args.camera_ids)
     print(f'Camera IDs: {camera_ids}')
-    start_time = time.time()
 
     rife_interpolator = None
     if args.stretch_ghost > 1 or (
@@ -117,9 +223,13 @@ def main():
         strategy = create_strategy(args.method, slicer, camera_ids)
 
         print(f'Starting spacetime slicer with {args.method}')
-        print(f'Frames: {args.start_frame} -> {args.freeze_frame} -> {end_frame}')
+        print(f'Frames: slices start at {args.start_frame}, recovered/frozen at {args.freeze_frame}, tail ends before {end_frame}')
         print(f'RIFE factors: slices={args.stretch_ghost}, freeze_orbit={args.stretch_freeze}')
         print(f'Freeze orbit interpolation: {args.freeze_interp_mode}')
+
+        if args.debug_extract_frames:
+            save_debug_extractions(strategy, slicer, args, camera_ids, end_frame)
+            return
 
         slicer.generate(
             strategy,
@@ -140,7 +250,14 @@ def main():
             freeze_interp_mode=args.freeze_interp_mode,
             background_mode=args.background_mode,
             recovery_transition_frames=args.recovery_transition_frames,
+            initial_canvas_mode=args.initial_canvas_mode,
             initial_subject_patch_mode=args.initial_subject_patch_mode,
+            initial_subject_patch_frame=args.initial_subject_patch_frame,
+            initial_patch_alpha_threshold=args.initial_patch_alpha_threshold,
+            initial_patch_dilate=args.initial_patch_dilate,
+            effect_base_mode=args.effect_base_mode,
+            live_subject_opacity=args.live_subject_opacity,
+            live_subject_alpha_threshold=args.live_subject_alpha_threshold,
         )
     finally:
         if rife_interpolator is not None:

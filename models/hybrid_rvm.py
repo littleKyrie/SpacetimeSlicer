@@ -12,12 +12,10 @@ class HybridStrategy(SegmentationStrategy):
         self.diff_threshold = diff_threshold
         self.model = torch.hub.load("C:\\Users\\Administrator\\.cache\\torch\\hub\\PeterL1n_RobustVideoMatting_master", "resnet50", source='local').to(self.device).eval()
         self.rec = [None] * 4
-        self.transform = transforms.ToTensor()
 
     def process_frame(self, current_img, current_idx):
         # 1. RVM 核心
-        pil_img = Image.fromarray(cv2.cvtColor(current_img, cv2.COLOR_BGR2RGB))
-        tensor_img = self.transform(pil_img).unsqueeze(0).to(self.device)
+        tensor_img = bgr_frame_to_tensor(current_img).unsqueeze(0).to(self.device)
         with torch.no_grad():
             fgr, pha, *self.rec = self.model(tensor_img, *self.rec, downsample_ratio=0.25)
         rvm_mask = (pha[0].cpu().numpy().transpose(1, 2, 0) * 255).astype(np.uint8)[:, :, 0]

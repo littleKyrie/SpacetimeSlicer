@@ -79,10 +79,53 @@ class SpacetimeSlicer:
         sampled_frames = [self.read_frame(i, camera_id) for i in sample_indices]
         return np.median(np.stack(sampled_frames, axis=0), axis=0).astype(np.uint8)
 
+    def resolve_initial_subject_replacement(self, mode, camera_id, freeze_idx, patch_frame_idx=None):
+        if mode == 'none':
+            return None
+        if mode == 'median':
+            return self.build_temporal_median_background(camera_id)
+        if mode == 'freeze':
+            return self.read_frame(freeze_idx, camera_id).copy()
+        if mode == 'frame':
+            resolved_patch_idx = freeze_idx if patch_frame_idx is None else patch_frame_idx
+            if resolved_patch_idx >= len(self.frame_paths_dict[camera_id]):
+                raise ValueError(f"Camera {camera_id} does not contain patch frame {resolved_patch_idx}")
+            return self.read_frame(resolved_patch_idx, camera_id).copy()
+        raise ValueError(f"Unknown initial subject patch mode: {mode}")
+
+    def patch_initial_subject_region(self, base_frame, replacement_frame, alpha_mask,
+                                     alpha_threshold=1, dilate_iterations=1):
+        patch_mask = (alpha_mask > alpha_threshold).astype(np.uint8)
+        if dilate_iterations > 0:
+            kernel = np.ones((3, 3), np.uint8)
+            patch_mask = cv2.dilate(patch_mask, kernel, iterations=dilate_iterations)
+        patch_alpha = np.repeat(patch_mask[:, :, np.newaxis], 3, axis=2).astype(np.float32)
+        return (
+            base_frame * (1 - patch_alpha) +
+            replacement_frame * patch_alpha
+        ).astype(np.uint8)
+
     def resolve_fade_duration(self, effect_frame_count, fade_duration_frames):
         if fade_duration_frames is not None:
             return fade_duration_frames
-        return max(effect_frame_count, max(2, self.fps // 2))
+        return min(effect_frame_count, max(2, self.fps // 2))
+
+    def resolve_effect_schedule(self, effect_start_idx, freeze_idx, fade_duration_frames):
+        effect_frame_count = freeze_idx - effect_start_idx + 1
+        if effect_frame_count < 2:
+            raise ValueError("Expected at least two frames between effect_start_idx and freeze_idx")
+
+        total_fade_frames = self.resolve_fade_duration(effect_frame_count, fade_duration_frames)
+        max_fade_frames = effect_frame_count - 1
+        if total_fade_frames > max_fade_frames:
+            if fade_duration_frames is not None:
+                raise ValueError(
+                    "fade_duration_frames must leave at least one frame for slice generation"
+                )
+            total_fade_frames = max_fade_frames
+
+        slice_end_idx = freeze_idx - total_fade_frames
+        return slice_end_idx, total_fade_frames
 
     def get_ghost_geometry(self, ghost):
         if 'geometry' in ghost:
@@ -139,14 +182,21 @@ class SpacetimeSlicer:
 
     def process_segment(self, strategy, camera_id, start_idx, end_idx, ghost_interval, edge_feather,
                         all_ghosts, permanent_indices, out, initial_canvas=None,
-                        initial_subject_replacement=None,
                         ghost_opacity_start=0.2, ghost_opacity_end=1.0,
-                        stretch_ghost=1):
-        """Accumulate translucent ghosts while keeping the current subject fully visible."""
+                        stretch_ghost=1,
+                        initial_subject_replacement=None,
+                        initial_patch_alpha_threshold=1,
+                        initial_patch_dilate=1,
+                        effect_base_mode='patched_canvas',
+                        live_subject_opacity=1.0,
+                        live_subject_alpha_threshold=16):
+        """Generate the slice segment using either source-frame or patched-canvas compositing."""
+        if effect_base_mode not in ('source', 'patched_canvas'):
+            raise ValueError(f"Unknown effect base mode: {effect_base_mode}")
+
         num_ghosts_expected = max(1, ((end_idx - 1 - start_idx) // ghost_interval) + 1)
         ghost_opacities = np.linspace(ghost_opacity_start, ghost_opacity_end, num_ghosts_expected)
 
-        # A clean initial canvas prevents the first source-frame subject from surviving recovery.
         if initial_canvas is not None:
             canvas_ghosts = initial_canvas.copy()
         else:
@@ -154,50 +204,76 @@ class SpacetimeSlicer:
 
         ghost_count = len(permanent_indices)
         stage_writer = self.create_rife_writer(out, stretch_ghost, start_idx, end_idx - 1)
-        last_frame_output = canvas_ghosts.copy()
+        last_frame_output = None
 
         for i in range(start_idx, end_idx):
             current_frame = self.read_frame(i, camera_id)
-            alpha_mask = strategy.process_frame(current_frame, i)
-
-            if edge_feather < 0:
-                kernel = np.ones((3, 3), np.uint8)
-                alpha_mask = cv2.erode(alpha_mask, kernel, iterations=abs(edge_feather))
-
+            base_frame = current_frame
             should_be_ghost = ((i - start_idx) % ghost_interval == 0)
-            alpha_normalized = np.repeat(alpha_mask[:, :, np.newaxis], 3, axis=2) / 255.0
+            needs_alpha = should_be_ghost or effect_base_mode == 'patched_canvas'
+            alpha_mask = None
+            if needs_alpha:
+                alpha_mask = strategy.process_frame(current_frame, i)
 
-            if i == start_idx and initial_subject_replacement is not None:
-                canvas_ghosts = (
-                    canvas_ghosts * (1 - alpha_normalized) +
-                    initial_subject_replacement * alpha_normalized
-                ).astype(np.uint8)
+                if edge_feather < 0:
+                    kernel = np.ones((3, 3), np.uint8)
+                    alpha_mask = cv2.erode(alpha_mask, kernel, iterations=abs(edge_feather))
+
+            if i == start_idx and initial_subject_replacement is not None and alpha_mask is not None:
+                patched_start_frame = self.patch_initial_subject_region(
+                    current_frame,
+                    initial_subject_replacement,
+                    alpha_mask,
+                    alpha_threshold=initial_patch_alpha_threshold,
+                    dilate_iterations=initial_patch_dilate,
+                )
+                base_frame = patched_start_frame
+                if effect_base_mode == 'patched_canvas':
+                    canvas_ghosts = patched_start_frame.copy()
 
             if should_be_ghost:
                 g_opacity = ghost_opacities[min(ghost_count, len(ghost_opacities) - 1)]
-                # Apply opacity to the complete alpha-over operation.
-                ghost_alpha = alpha_normalized * g_opacity
-                canvas_ghosts = (current_frame * ghost_alpha +
-                                 canvas_ghosts * (1 - ghost_alpha)).astype(np.uint8)
-                ghost_count += 1
-                permanent_indices.append(len(all_ghosts))
+                if effect_base_mode == 'patched_canvas':
+                    alpha_normalized = np.repeat(alpha_mask[:, :, np.newaxis], 3, axis=2) / 255.0
+                    ghost_alpha = alpha_normalized * g_opacity
+                    canvas_ghosts = (
+                        current_frame * ghost_alpha +
+                        canvas_ghosts * (1 - ghost_alpha)
+                    ).astype(np.uint8)
 
-            # 输出帧：完整人物叠加到残影画布上（所有帧人物都 100% 显示，无闪烁）
-            frame_output = (current_frame * alpha_normalized +
-                            canvas_ghosts * (1 - alpha_normalized)).astype(np.uint8)
+                permanent_indices.append(len(all_ghosts))
+                all_ghosts.append({
+                    'frame': current_frame.copy(),
+                    'alpha': alpha_mask.copy(),
+                    'opacity': g_opacity,
+                })
+                ghost_count += 1
+
+            if effect_base_mode == 'source':
+                frame_output = self.compose_static_ghosts(
+                    base_frame, all_ghosts, permanent_indices
+                )
+            else:
+                live_mask = (alpha_mask > live_subject_alpha_threshold).astype(np.float32)
+                live_alpha = np.repeat(live_mask[:, :, np.newaxis], 3, axis=2) * live_subject_opacity
+                frame_output = (
+                    current_frame * live_alpha +
+                    canvas_ghosts * (1 - live_alpha)
+                ).astype(np.uint8)
             last_frame_output = frame_output
 
             stage_writer.write(frame_output, i)
 
-            all_ghosts.append({
-                'frame': current_frame.copy(),
-                'alpha': alpha_mask.copy(),
-                'opacity': ghost_opacities[min(ghost_count - 1, len(ghost_opacities) - 1)] if should_be_ghost else 1.0
-            })
+            if effect_base_mode == 'patched_canvas' and not should_be_ghost:
+                all_ghosts.append({
+                    'frame': current_frame.copy(),
+                    'alpha': alpha_mask.copy(),
+                    'opacity': 1.0,
+                })
 
             print(f"  > 机位 {camera_id} 渲染特效帧: {i}/{end_idx-1} (已累积 {ghost_count} 个残影)", end='\r')
 
-        return canvas_ghosts, ghost_count, last_frame_output
+        return ghost_count, last_frame_output
 
     def process_freeze_transition(self, camera_ids, freeze_idx, out, stretch_freeze=1,
                                   interpolation_mode='rife'):
@@ -305,6 +381,19 @@ class SpacetimeSlicer:
             ).astype(np.uint8)
         return current_canvas
 
+    def compose_static_ghosts(self, background, all_ghosts, permanent_indices):
+        current_canvas = background.copy()
+        for p_idx in permanent_indices:
+            ghost = all_ghosts[p_idx]
+            ghost_opacity = ghost.get('opacity', 1.0)
+            ghost_alpha_3ch = np.repeat(
+                ghost['alpha'][:, :, np.newaxis], 3, axis=2
+            ) / 255.0 * ghost_opacity
+            current_canvas = (
+                ghost['frame'] * ghost_alpha_3ch + current_canvas * (1 - ghost_alpha_3ch)
+            ).astype(np.uint8)
+        return current_canvas
+
     def write_canvas_transition(self, out, first_frame, second_frame, transition_frames):
         for step in range(1, transition_frames + 1):
             ratio = step / (transition_frames + 1)
@@ -363,16 +452,25 @@ class SpacetimeSlicer:
                  stretch_head=1, stretch_ghost=1, stretch_fade=1,
                  stretch_freeze=1, stretch_tail=1,
                  background_mode='freeze', recovery_transition_frames=3,
-                 initial_subject_patch_mode='median', freeze_interp_mode='rife'):
+                 freeze_interp_mode='rife',
+                 initial_canvas_mode='patched_start',
+                 initial_subject_patch_mode='freeze',
+                 initial_subject_patch_frame=None,
+                 initial_patch_alpha_threshold=1,
+                 initial_patch_dilate=1,
+                 effect_base_mode='patched_canvas',
+                 live_subject_opacity=1.0,
+                 live_subject_alpha_threshold=16):
         """
         生成时空切片视频（残影渐变 → 回收 → 多视角凝结 → 继续播放）
 
         流程:
           1. 片头: 0 -> effect_start_idx（固定机位原样播放）
-          2. 特效段: effect_start_idx -> freeze_idx（残影+透明度渐变）
-             - 第一帧人物 = ghost #0, 直接应用 opacity 作为初始画布
-             - 后续残影线性叠加
-          3. 片尾淡出: 回收所有残影
+          2. 特效段: effect_start_idx -> slice_end_idx（残影+透明度渐变）
+             - 每个输出帧以原始视频帧为底
+             - 只在 ghost_interval 命中的帧分割人物并捕获为透明切片
+             - 已捕获切片按各自 opacity 叠加到当前原始帧上
+          3. 回收窗口: slice_end_idx+1 -> freeze_idx（回收所有残影）
           4. 凝结转场: 按 camera_ids 顺序输出各机位 freeze_idx 帧
           5. 继续播放: freeze_idx+1 -> effect_end_idx（终止机位原样播放）
         """
@@ -385,8 +483,22 @@ class SpacetimeSlicer:
             raise ValueError("ghost_interval must be at least 1")
         if not 0.0 <= ghost_opacity_start <= 1.0 or not 0.0 <= ghost_opacity_end <= 1.0:
             raise ValueError("ghost opacity must be between 0 and 1")
-        if not effect_start_idx <= freeze_idx < effect_end_idx:
-            raise ValueError("Expected effect_start_idx <= freeze_idx < effect_end_idx")
+        if initial_canvas_mode not in ('patched_start', 'clean'):
+            raise ValueError(f"Unknown initial canvas mode: {initial_canvas_mode}")
+        if initial_subject_patch_mode not in ('none', 'median', 'freeze', 'frame'):
+            raise ValueError(f"Unknown initial subject patch mode: {initial_subject_patch_mode}")
+        if not 0 <= initial_patch_alpha_threshold <= 255:
+            raise ValueError("initial_patch_alpha_threshold must be between 0 and 255")
+        if initial_patch_dilate < 0:
+            raise ValueError("initial_patch_dilate must not be negative")
+        if effect_base_mode not in ('source', 'patched_canvas'):
+            raise ValueError(f"Unknown effect base mode: {effect_base_mode}")
+        if not 0.0 <= live_subject_opacity <= 1.0:
+            raise ValueError("live_subject_opacity must be between 0 and 1")
+        if not 0 <= live_subject_alpha_threshold <= 255:
+            raise ValueError("live_subject_alpha_threshold must be between 0 and 255")
+        if not effect_start_idx < freeze_idx < effect_end_idx:
+            raise ValueError("Expected effect_start_idx < freeze_idx < effect_end_idx")
         if fade_duration_frames is not None and fade_duration_frames < 1:
             raise ValueError("fade_duration_frames must be at least 1")
         if recovery_transition_frames < 0:
@@ -405,7 +517,10 @@ class SpacetimeSlicer:
         if effect_end_idx > len(self.frame_paths_dict[end_cam]):
             raise ValueError(f"Camera {end_cam} does not contain frames up to {effect_end_idx - 1}")
 
-        stretch_suffix = f"_sh{stretch_head}_sg{stretch_ghost}_sfd{stretch_fade}_sfz{stretch_freeze}_st{stretch_tail}_rife_fim{freeze_interp_mode}_patch{initial_subject_patch_mode}_recoverybg{background_mode}_rt{recovery_transition_frames}"
+        patch_suffix = initial_subject_patch_mode
+        if initial_subject_patch_mode == 'frame':
+            patch_suffix = f"frame{freeze_idx if initial_subject_patch_frame is None else initial_subject_patch_frame}"
+        stretch_suffix = f"_sh{stretch_head}_sg{stretch_ghost}_sfd{stretch_fade}_sfz{stretch_freeze}_st{stretch_tail}_rife_fim{freeze_interp_mode}_patch{patch_suffix}_canvas{initial_canvas_mode}_base{effect_base_mode}_live{live_subject_alpha_threshold}_recoverybg{background_mode}_rt{recovery_transition_frames}"
         run_name = f"freeze_{start_cam}_to_{end_cam}_seq{len(camera_ids)}_s{effect_start_idx}_f{freeze_idx}_e{effect_end_idx}{stretch_suffix}"
         output_dir = os.path.join(self.output_root, run_name)
         os.makedirs(output_dir, exist_ok=True)
@@ -425,8 +540,9 @@ class SpacetimeSlicer:
         all_ghosts = []
         permanent_indices = []
 
-        effect_frame_count = freeze_idx - effect_start_idx + 1
-        total_fade_frames = self.resolve_fade_duration(effect_frame_count, fade_duration_frames)
+        slice_end_idx, total_fade_frames = self.resolve_effect_schedule(
+            effect_start_idx, freeze_idx, fade_duration_frames
+        )
 
         # ============ 1. 写入片头 ============
         print("写入片头...")
@@ -436,23 +552,40 @@ class SpacetimeSlicer:
             print(f"  片头完成: 0 -> {effect_start_idx-1} ({effect_start_idx} 帧, ×{stretch_head})")
 
         # ============ 2. 特效段: 固定机位 + 残影 + 透明度渐变 ============
-        print(f"\n特效段: 机位 {start_cam} ({effect_start_idx} -> {freeze_idx})")
+        print(f"\n特效段: 机位 {start_cam} ({effect_start_idx} -> {slice_end_idx})")
         print(f"   残影透明度: {ghost_opacity_start:.0%} -> {ghost_opacity_end:.0%}, 插帧 ×{stretch_ghost}")
-        generation_canvas = self.read_frame(effect_start_idx, start_cam).copy()
-        if initial_subject_patch_mode == 'median':
-            initial_subject_replacement = self.build_temporal_median_background(start_cam)
-        elif initial_subject_patch_mode == 'freeze':
-            initial_subject_replacement = self.read_frame(freeze_idx, start_cam).copy()
+        print(f"   回收窗口: {slice_end_idx + 1} -> {freeze_idx} ({total_fade_frames} 帧)")
+        print("   特效底图模式: source（原始视频帧 + 已捕获切片）")
+        source_start_frame = self.read_frame(effect_start_idx, start_cam).copy()
+        initial_subject_replacement = self.resolve_initial_subject_replacement(
+            initial_subject_patch_mode,
+            start_cam,
+            freeze_idx,
+            initial_subject_patch_frame,
+        )
+        if initial_canvas_mode == 'patched_start':
+            generation_canvas = source_start_frame
+        elif initial_canvas_mode == 'clean':
+            generation_canvas = (
+                source_start_frame if initial_subject_replacement is None
+                else initial_subject_replacement
+            )
         else:
-            raise ValueError(f"Unknown initial subject patch mode: {initial_subject_patch_mode}")
-        canvas_ghosts, ghost_count, last_effect_frame = self.process_segment(
-            strategy, start_cam, effect_start_idx, freeze_idx + 1,
+            raise ValueError(f"Unknown initial canvas mode: {initial_canvas_mode}")
+        print(f"   Effect base mode: {effect_base_mode}, initial canvas: {initial_canvas_mode}")
+        ghost_count, last_effect_frame = self.process_segment(
+            strategy, start_cam, effect_start_idx, slice_end_idx + 1,
             ghost_interval, edge_feather, all_ghosts, permanent_indices, out,
             initial_canvas=generation_canvas,
-            initial_subject_replacement=initial_subject_replacement,
             ghost_opacity_start=ghost_opacity_start,
             ghost_opacity_end=ghost_opacity_end,
-            stretch_ghost=stretch_ghost
+            stretch_ghost=stretch_ghost,
+            initial_subject_replacement=initial_subject_replacement,
+            initial_patch_alpha_threshold=initial_patch_alpha_threshold,
+            initial_patch_dilate=initial_patch_dilate,
+            effect_base_mode=effect_base_mode,
+            live_subject_opacity=live_subject_opacity,
+            live_subject_alpha_threshold=live_subject_alpha_threshold,
         )
 
         # ============ 3. 片尾淡出: 回收所有残影 ============
@@ -461,7 +594,7 @@ class SpacetimeSlicer:
         elif background_mode == 'freeze':
             fade_background = self.read_frame(freeze_idx, start_cam).copy()
         elif background_mode == 'start':
-            fade_background = generation_canvas
+            fade_background = source_start_frame
         else:
             raise ValueError(f"Unknown background mode: {background_mode}")
         self.process_fade_out(out, all_ghosts, permanent_indices, fade_background, total_fade_frames,

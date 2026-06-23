@@ -4,8 +4,12 @@
 import cv2
 import numpy as np
 import torch
-from torchvision import transforms
-from PIL import Image
+
+
+def bgr_frame_to_tensor(frame):
+    """Convert a BGR uint8 OpenCV frame to an RGB CHW float tensor in [0, 1]."""
+    rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    return torch.from_numpy(rgb_frame).permute(2, 0, 1).float().div(255.0)
 
 
 class SegmentationStrategy:
