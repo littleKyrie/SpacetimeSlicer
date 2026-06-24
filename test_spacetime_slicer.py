@@ -1,3 +1,4 @@
+import json
 import unittest
 import tempfile
 from pathlib import Path
@@ -79,6 +80,18 @@ class SpacetimeSlicerTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'start_frame'):
             normalize_cli_frame_args(args)
 
+    def test_end_frame_can_be_omitted_until_input_frames_are_loaded(self):
+        args = build_parser().parse_args([
+            '--input_dir', 'data',
+            '--output_dir', 'results',
+            '--freeze_frame', '125',
+        ])
+
+        normalize_cli_frame_args(args)
+
+        self.assertIsNone(args.end_frame)
+        self.assertIsNone(args.source_end_frame)
+
     def test_cli_accepts_tail_camera_id(self):
         args = build_parser().parse_args([
             '--input_dir', 'data',
@@ -101,6 +114,45 @@ class SpacetimeSlicerTest(unittest.TestCase):
         ])
 
         self.assertEqual(args.recovery_timing, 'before_freeze')
+
+    def test_config_supplies_arguments_and_cli_overrides_config(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / 'slicer.json'
+            config_path.write_text(json.dumps({
+                'input_dir': 'config-input',
+                'output_dir': 'config-output',
+                'freeze_frame': 125,
+                'end_frame': 149,
+                'fps': 24,
+                'rife_uhd': True,
+            }), encoding='utf-8')
+
+            args = build_parser().parse_args([
+                '--config', str(config_path),
+                '--fps', '30',
+                '--no-rife_uhd',
+            ])
+
+            self.assertEqual(args.input_dir, 'config-input')
+            self.assertEqual(args.output_dir, 'config-output')
+            self.assertEqual(args.freeze_frame, 125)
+            self.assertEqual(args.end_frame, 149)
+            self.assertEqual(args.fps, 30)
+            self.assertFalse(args.rife_uhd)
+
+    def test_config_rejects_unknown_options(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / 'slicer.json'
+            config_path.write_text(json.dumps({
+                'input_dir': 'input',
+                'output_dir': 'output',
+                'freeze_frame': 125,
+                'end_frame': 149,
+                'fpss': 24,
+            }), encoding='utf-8')
+
+            with self.assertRaises(SystemExit):
+                build_parser().parse_args(['--config', str(config_path)])
 
     def test_sparse_frame_index_ignores_non_frame_directories(self):
         with tempfile.TemporaryDirectory() as tmp:

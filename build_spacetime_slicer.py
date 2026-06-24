@@ -1,12 +1,99 @@
 import argparse
+import json
 import os
 import time
+from pathlib import Path
 
 import cv2
 import numpy as np
 
 from models.rife_ncnn import RifeNcnnInterpolator
 from models.spacetime_slicer import SpacetimeSlicer
+
+
+DEFAULT_CONFIG_PATH = Path(__file__).resolve().parent / 'configs' / 'spacetime_slicer.json'
+REQUIRED_ARGUMENTS = ('input_dir', 'output_dir', 'freeze_frame')
+
+
+class ConfigArgumentParser(argparse.ArgumentParser):
+    """Argument parser whose JSON config values are overridden by CLI values."""
+
+    def _load_config(self, path):
+        config_path = Path(path).expanduser()
+        try:
+            with config_path.open('r', encoding='utf-8') as config_file:
+                config = json.load(config_file)
+        except FileNotFoundError:
+            self.error(f'config file not found: {config_path}')
+        except json.JSONDecodeError as exc:
+            self.error(
+                f'invalid JSON in config file {config_path}: '
+                f'line {exc.lineno}, column {exc.colno}: {exc.msg}'
+            )
+
+        if not isinstance(config, dict):
+            self.error(f'config file must contain a JSON object: {config_path}')
+
+        actions = {
+            action.dest: action
+            for action in self._actions
+            if action.dest not in ('help', 'config')
+        }
+        unknown_keys = sorted(set(config) - set(actions))
+        if unknown_keys:
+            self.error(
+                f'unknown config option(s) in {config_path}: '
+                f'{", ".join(unknown_keys)}'
+            )
+
+        validated = {}
+        for key, value in config.items():
+            action = actions[key]
+            if isinstance(action, argparse.BooleanOptionalAction):
+                if not isinstance(value, bool):
+                    self.error(f'config option {key} must be true or false')
+                validated[key] = value
+                continue
+
+            if value is not None and action.type is not None:
+                try:
+                    value = action.type(value)
+                except (TypeError, ValueError) as exc:
+                    self.error(f'invalid value for config option {key}: {exc}')
+
+            if value is not None and action.choices is not None and value not in action.choices:
+                choices = ', '.join(map(str, action.choices))
+                self.error(
+                    f'invalid value for config option {key}: {value!r} '
+                    f'(choose from {choices})'
+                )
+            validated[key] = value
+
+        return validated
+
+    def parse_args(self, args=None, namespace=None):
+        config_parser = argparse.ArgumentParser(add_help=False)
+        config_parser.add_argument('--config', default=str(DEFAULT_CONFIG_PATH))
+        config_args, _ = config_parser.parse_known_args(args)
+
+        config_defaults = self._load_config(config_args.config)
+        if namespace is None:
+            namespace = argparse.Namespace()
+        for key, value in config_defaults.items():
+            setattr(namespace, key, value)
+
+        parsed = super().parse_args(args, namespace)
+        missing = [
+            f'--{name}'
+            for name in REQUIRED_ARGUMENTS
+            if getattr(parsed, name, None) in (None, '')
+        ]
+        if missing:
+            self.error(
+                'the following arguments are required in the config file or '
+                f'on the command line: {", ".join(missing)}'
+            )
+        return parsed
 
 
 def parse_camera_ids(value):
@@ -29,8 +116,9 @@ def normalize_cli_frame_args(args):
     frame_values = {
         'start_frame': args.start_frame,
         'freeze_frame': args.freeze_frame,
-        'end_frame': args.end_frame,
     }
+    if args.end_frame is not None:
+        frame_values['end_frame'] = args.end_frame
     if args.initial_subject_patch_frame is not None:
         frame_values['initial_subject_patch_frame'] = args.initial_subject_patch_frame
 
@@ -174,17 +262,25 @@ def save_debug_extractions(strategy, slicer, args, camera_ids, end_frame):
 
 
 def build_parser():
-    parser = argparse.ArgumentParser(description='Spacetime Slicer')
-    parser.add_argument('--input_dir', required=True)
-    parser.add_argument('--output_dir', '--output_root', dest='output_dir', required=True)
-    parser.add_argument('--camera_ids', default='0', help='Comma-separated IDs or inclusive range, such as 0:30 (its id corresponds to the actual file id in the subdir)')
+    parser = ConfigArgumentParser(
+        description='Spacetime Slicer',
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    parser.add_argument(
+        '--config',
+        default=str(DEFAULT_CONFIG_PATH),
+        help='JSON config file. Command-line arguments override its values.',
+    )
+    parser.add_argument('--input_dir')
+    parser.add_argument('--output_dir', '--output_root', dest='output_dir')
+    parser.add_argument('--camera_ids', default='0', help='Comma-separated IDs or inclusive range, such as 1:30 (its id corresponds to the actual file id in the subdir)')
     parser.add_argument('--fps', type=int, default=25, help='FPS of the output video')
-    parser.add_argument('--start_frame', type=int, default=1, help='1-based source frame ID where ghost effects start, inclusive.')
-    parser.add_argument('--freeze_frame', type=int, required=True, help='1-based source frame ID where slice recovery completes and the multi-camera freeze orbit begins.')
-    parser.add_argument('--end_frame', type=int, required=True, help='1-based source frame ID where output ends, inclusive.')
-    parser.add_argument('--ghost_interval', type=int, default=1)
+    parser.add_argument('--start_frame', type=int, help='1-based source frame ID where ghost effects start, inclusive.')
+    parser.add_argument('--freeze_frame', type=int, help='1-based source frame ID where slice recovery completes and the multi-camera freeze orbit begins.')
+    parser.add_argument('--end_frame', type=int, default=None, help='1-based source frame ID where output ends, inclusive; defaults to the last source frame.')
+    parser.add_argument('--ghost_interval', type=int, default=20)
     parser.add_argument('--edge_feather', type=int, default=0)
-    parser.add_argument('--fade_duration_frames', type=int, help='Recovery duration in frames; defaults to about half a second')
+    parser.add_argument('--fade_duration_frames', type=int, default=10, help='Recovery duration in frames.')
     parser.add_argument('--ghost_opacity_start', type=float, default=0.2)
     parser.add_argument('--ghost_opacity_end', type=float, default=1.0)
     parser.add_argument('--initial_subject_patch_mode', default='freeze', choices=['none', 'median', 'freeze', 'frame'], help='Background source for removing the start-frame subject before overlaying the first translucent slice')
@@ -226,7 +322,12 @@ def build_parser():
         '--rife_model_dir',
         help='Optional RIFE v4 model directory; defaults to rife-v4.6 next to the executable',
     )
-    parser.add_argument('--rife_uhd', action='store_true')
+    parser.add_argument(
+        '--rife_uhd',
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help='Enable UHD mode; use --no-rife_uhd to override a true config value.',
+    )
     parser.add_argument('--method', default='RVM',
                         help='RVM, Hybrid, SAM2_BBox, RMBG2, or rembg-<model>')
     return parser
@@ -257,7 +358,10 @@ def main():
             rife_interpolator=rife_interpolator,
         )
         print(f'Device: {slicer.device}')
-        end_frame = args.end_frame if args.end_frame is not None else slicer.total_frames
+        if args.end_frame is None:
+            args.end_frame = slicer.total_frames
+            args.source_end_frame = slicer.total_frames
+        end_frame = args.end_frame
         strategy = create_strategy(args.method, slicer, camera_ids)
 
         print(f'Starting spacetime slicer with {args.method}')
