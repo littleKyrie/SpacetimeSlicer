@@ -1,10 +1,16 @@
+import json
 import io
 import tempfile
 import unittest
 from contextlib import redirect_stdout
 from pathlib import Path
 
-from reorganize_frame_images import ReorganizationError, parse_args, reorganize_directory
+from utils.reorganize_frame_images import (
+    ReorganizationError,
+    has_reorganized_frame_structure,
+    parse_args,
+    reorganize_directory,
+)
 
 
 def make_source_images(directory, count):
@@ -14,6 +20,41 @@ def make_source_images(directory, count):
 
 
 class ReorganizeFrameImagesTest(unittest.TestCase):
+    def test_detects_existing_reorganized_frame_structure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for frame_number in range(1, 4):
+                frame_dir = root / f'{frame_number:04d}'
+                frame_dir.mkdir()
+                (frame_dir / '001.jpg').write_bytes(b'frame')
+            (root / '0002' / '002.jpg').write_bytes(b'camera-2')
+            (root / '0002' / '003.jpg').write_bytes(b'camera-3')
+
+            self.assertTrue(
+                has_reorganized_frame_structure(
+                    root,
+                    pre_frame_count=2,
+                    camera_count=2,
+                )
+            )
+
+    def test_reorganized_structure_rejects_incomplete_camera_frame(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for frame_number in range(1, 4):
+                frame_dir = root / f'{frame_number:04d}'
+                frame_dir.mkdir()
+                (frame_dir / '001.jpg').write_bytes(b'frame')
+            (root / '0002' / '002.jpg').write_bytes(b'camera-2')
+
+            self.assertFalse(
+                has_reorganized_frame_structure(
+                    root,
+                    pre_frame_count=2,
+                    camera_count=2,
+                )
+            )
+
     def test_parse_args_accepts_input_dir_option(self):
         args = parse_args(['--input_dir', './data/QP-2026-06-23-174635'])
 
@@ -23,6 +64,30 @@ class ReorganizeFrameImagesTest(unittest.TestCase):
         args = parse_args(['./data/QP-2026-06-23-174635'])
 
         self.assertEqual(args.input_dir, './data/QP-2026-06-23-174635')
+
+    def test_config_values_are_overridden_by_command_line(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / 'reorganize.json'
+            config_path.write_text(json.dumps({
+                'pre_frame_count': 100,
+                'camera_count': 30,
+                'original_dir_name': 'originals',
+                'normalized_dir_name': 'normalized',
+                'image_ext': '.png',
+                'dry_run': True,
+            }), encoding='utf-8')
+
+            args = parse_args([
+                '--config', str(config_path),
+                '--input_dir', './data/source',
+                '--camera-count', '45',
+                '--no-dry-run',
+            ])
+
+            self.assertEqual(args.pre_frame_count, 100)
+            self.assertEqual(args.camera_count, 45)
+            self.assertEqual(args.image_ext, '.png')
+            self.assertFalse(args.dry_run)
 
     def test_reorganizes_effect_frame_with_camera_count_plus_one(self):
         with tempfile.TemporaryDirectory() as tmp:

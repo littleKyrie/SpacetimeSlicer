@@ -1,0 +1,8 @@
+{
+  "pre_frame_count": 125,
+  "camera_count": 90,
+  "original_dir_name": "原始图片",
+  "normalized_dir_name": "重命名数据",
+  "image_ext": ".jpg",
+  "dry_run": false
+}

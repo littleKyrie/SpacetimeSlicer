@@ -333,9 +333,9 @@ def build_parser():
     return parser
 
 
-def main():
+def main(argv=None):
     start_time = time.time()
-    args = normalize_cli_frame_args(build_parser().parse_args())
+    args = normalize_cli_frame_args(build_parser().parse_args(argv))
     camera_ids = parse_camera_ids(args.camera_ids)
     print(f'Camera IDs: {camera_ids}')
 

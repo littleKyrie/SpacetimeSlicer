@@ -1,4 +1,5 @@
 import argparse
+import json
 import re
 import shutil
 import sys
@@ -8,6 +9,7 @@ from pathlib import Path
 
 SUPPORTED_IMAGE_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.bmp', '.webp'}
 NUMBER_PATTERN = re.compile(r'(\d+)')
+DEFAULT_CONFIG_PATH = Path(__file__).resolve().parents[1] / 'configs' / 'reorganize_frame_images.json'
 DEFAULT_ORIGINAL_DIR_NAME = '原始图片'
 DEFAULT_NORMALIZED_DIR_NAME = '重命名数据'
 
@@ -67,6 +69,48 @@ def discover_images(input_dir):
         raise ReorganizationError(f'No supported image files found in: {input_path}')
 
     return sorted(numbered_images, key=lambda image: image.sequence_id)
+
+
+def has_reorganized_frame_structure(
+    input_dir,
+    pre_frame_count=125,
+    camera_count=90,
+    image_ext='.jpg',
+):
+    """Return whether input_dir already matches the generated frame layout."""
+    input_path = Path(input_dir)
+    if not input_path.is_dir() or pre_frame_count < 1 or camera_count < 1:
+        return False
+
+    image_ext = normalize_extension(image_ext)
+    frame_dirs = {}
+    for path in input_path.iterdir():
+        if path.is_dir() and path.name.isdigit():
+            frame_number = int(path.name)
+            if frame_number < 1 or frame_number in frame_dirs:
+                return False
+            frame_dirs[frame_number] = path
+
+    if not frame_dirs:
+        return False
+
+    last_frame = max(frame_dirs)
+    if last_frame < pre_frame_count + 1:
+        return False
+    if set(frame_dirs) != set(range(1, last_frame + 1)):
+        return False
+
+    for frame_dir in frame_dirs.values():
+        if not (frame_dir / f'001{image_ext}').is_file():
+            return False
+
+    effect_frame_dir = frame_dirs.get(pre_frame_count)
+    if effect_frame_dir is None:
+        return False
+    return all(
+        (effect_frame_dir / f'{camera_id:03d}{image_ext}').is_file()
+        for camera_id in range(1, camera_count + 2)
+    )
 
 
 def make_unique_operations(operations):
@@ -208,9 +252,15 @@ def reorganize_directory(
     return operations
 
 
-def parse_args(argv=None):
+def build_parser():
     parser = argparse.ArgumentParser(
-        description='Reorganize numbered source images into frame/camera directories.'
+        description='Reorganize numbered source images into frame/camera directories.',
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    parser.add_argument(
+        '--config',
+        default=str(DEFAULT_CONFIG_PATH),
+        help='JSON config file. Command-line arguments override its values.',
     )
     parser.add_argument(
         'input_dir_positional',
@@ -252,9 +302,61 @@ def parse_args(argv=None):
     )
     parser.add_argument(
         '--dry-run',
-        action='store_true',
+        action=argparse.BooleanOptionalAction,
+        default=False,
         help='Print planned copy operations without creating directories or files.',
     )
+    return parser
+
+
+def load_config(parser, path):
+    config_path = Path(path).expanduser()
+    try:
+        with config_path.open('r', encoding='utf-8') as config_file:
+            config = json.load(config_file)
+    except FileNotFoundError:
+        parser.error(f'config file not found: {config_path}')
+    except json.JSONDecodeError as exc:
+        parser.error(
+            f'invalid JSON in config file {config_path}: '
+            f'line {exc.lineno}, column {exc.colno}: {exc.msg}'
+        )
+
+    if not isinstance(config, dict):
+        parser.error(f'config file must contain a JSON object: {config_path}')
+
+    actions = {
+        action.dest: action
+        for action in parser._actions
+        if action.dest not in ('help', 'config', 'input_dir_positional', 'input_dir_option')
+    }
+    unknown_keys = sorted(set(config) - set(actions))
+    if unknown_keys:
+        parser.error(
+            f'unknown config option(s) in {config_path}: {", ".join(unknown_keys)}'
+        )
+
+    for key, value in config.items():
+        action = actions[key]
+        if isinstance(action, argparse.BooleanOptionalAction):
+            if not isinstance(value, bool):
+                parser.error(f'config option {key} must be true or false')
+            continue
+        if value is not None and action.type is not None:
+            try:
+                config[key] = action.type(value)
+            except (TypeError, ValueError) as exc:
+                parser.error(f'invalid value for config option {key}: {exc}')
+    return config
+
+
+def parse_args(argv=None):
+    config_parser = argparse.ArgumentParser(add_help=False)
+    config_parser.add_argument('--config', default=str(DEFAULT_CONFIG_PATH))
+    config_args, _ = config_parser.parse_known_args(argv)
+
+    parser = build_parser()
+    parser.set_defaults(**load_config(parser, config_args.config))
     args = parser.parse_args(argv)
     args.input_dir = args.input_dir_option or args.input_dir_positional
     if args.input_dir is None:
