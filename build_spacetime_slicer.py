@@ -24,6 +24,32 @@ def parse_frame_ids(value):
     return parse_camera_ids(value)
 
 
+def normalize_cli_frame_args(args):
+    """Convert 1-based source frame IDs from the CLI to internal frame indices."""
+    frame_values = {
+        'start_frame': args.start_frame,
+        'freeze_frame': args.freeze_frame,
+        'end_frame': args.end_frame,
+    }
+    if args.initial_subject_patch_frame is not None:
+        frame_values['initial_subject_patch_frame'] = args.initial_subject_patch_frame
+
+    for name, value in frame_values.items():
+        if value < 1:
+            raise ValueError(f'{name} must be a 1-based frame id, got {value}')
+
+    args.source_start_frame = args.start_frame
+    args.source_freeze_frame = args.freeze_frame
+    args.source_end_frame = args.end_frame
+    args.source_initial_subject_patch_frame = args.initial_subject_patch_frame
+
+    args.start_frame -= 1
+    args.freeze_frame -= 1
+    if args.initial_subject_patch_frame is not None:
+        args.initial_subject_patch_frame -= 1
+    return args
+
+
 def create_strategy(method, slicer, camera_ids):
     if method == 'RVM':
         from models.rvm import RVMStrategy
@@ -65,6 +91,7 @@ def save_debug_extractions(strategy, slicer, args, camera_ids, end_frame):
         args.start_frame,
         args.freeze_frame,
         args.fade_duration_frames,
+        args.recovery_timing,
     )
     ghost_frames = list(range(args.start_frame, slice_end_idx + 1, args.ghost_interval))
     ghost_opacities = np.linspace(
@@ -152,16 +179,16 @@ def build_parser():
     parser.add_argument('--output_dir', '--output_root', dest='output_dir', required=True)
     parser.add_argument('--camera_ids', default='0', help='Comma-separated IDs or inclusive range, such as 0:30 (its id corresponds to the actual file id in the subdir)')
     parser.add_argument('--fps', type=int, default=25, help='FPS of the output video')
-    parser.add_argument('--start_frame', type=int, default=0, help='Start frame of the ghost effects (inclusive and its id should be +1 to corresponds to the actual subdir id)')
-    parser.add_argument('--freeze_frame', type=int, required=True, help='Frame where slice recovery is complete and the multi-camera freeze orbit begins (inclusive; its id should be +1 to correspond to the actual subdir id)')
-    parser.add_argument('--end_frame', type=int, required=True, help='End frame of the input video (exclusive and its id should be +1 to corresponds to the actual subdir id)')
+    parser.add_argument('--start_frame', type=int, default=1, help='1-based source frame ID where ghost effects start, inclusive.')
+    parser.add_argument('--freeze_frame', type=int, required=True, help='1-based source frame ID where slice recovery completes and the multi-camera freeze orbit begins.')
+    parser.add_argument('--end_frame', type=int, required=True, help='1-based source frame ID where output ends, inclusive.')
     parser.add_argument('--ghost_interval', type=int, default=1)
     parser.add_argument('--edge_feather', type=int, default=0)
-    parser.add_argument('--fade_duration_frames', type=int, help='Recovery duration before --freeze_frame; defaults to about half a second')
+    parser.add_argument('--fade_duration_frames', type=int, help='Recovery duration in frames; defaults to about half a second')
     parser.add_argument('--ghost_opacity_start', type=float, default=0.2)
     parser.add_argument('--ghost_opacity_end', type=float, default=1.0)
     parser.add_argument('--initial_subject_patch_mode', default='freeze', choices=['none', 'median', 'freeze', 'frame'], help='Background source for removing the start-frame subject before overlaying the first translucent slice')
-    parser.add_argument('--initial_subject_patch_frame', type=int, help='Manual frame index used when --initial_subject_patch_mode frame; defaults to --freeze_frame')
+    parser.add_argument('--initial_subject_patch_frame', type=int, help='Manual 1-based source frame ID used when --initial_subject_patch_mode frame; defaults to --freeze_frame')
     parser.add_argument('--initial_canvas_mode', default='patched_start', choices=['patched_start', 'clean'], help='Initial canvas for patched_canvas mode: patched_start uses start_frame with the subject region replaced; clean starts from the replacement frame')
     parser.add_argument('--initial_patch_alpha_threshold', type=int, default=1, help='Alpha threshold used to remove the start-frame subject from the first output frame')
     parser.add_argument('--initial_patch_dilate', type=int, default=1, help='Dilate the start-frame subject patch mask to remove edge residue')
@@ -181,8 +208,19 @@ def build_parser():
         help='Freeze orbit: rife=synthesize views, repeat=hold real frames, blend=crossfade real frames',
     )
     parser.add_argument('--stretch_tail', type=int, default=1)
+    parser.add_argument(
+        '--tail_camera_id',
+        type=int,
+        help='Camera used after the freeze orbit; defaults to the last camera with tail frames, falling back to the first camera for sparse freeze-only views.',
+    )
     parser.add_argument('--background_mode', default='freeze', choices=['median', 'freeze', 'start'])
     parser.add_argument('--recovery_transition_frames', type=int, default=3)
+    parser.add_argument(
+        '--recovery_timing',
+        default='after_freeze',
+        choices=['after_freeze', 'before_freeze'],
+        help='after_freeze inserts recovery frames after the freeze source frame; before_freeze reserves source frames before freeze for recovery.',
+    )
     parser.add_argument('--rife_exe', help='Path to rife-ncnn-vulkan executable')
     parser.add_argument(
         '--rife_model_dir',
@@ -196,7 +234,7 @@ def build_parser():
 
 def main():
     start_time = time.time()
-    args = build_parser().parse_args()
+    args = normalize_cli_frame_args(build_parser().parse_args())
     camera_ids = parse_camera_ids(args.camera_ids)
     print(f'Camera IDs: {camera_ids}')
 
@@ -223,7 +261,12 @@ def main():
         strategy = create_strategy(args.method, slicer, camera_ids)
 
         print(f'Starting spacetime slicer with {args.method}')
-        print(f'Frames: slices start at {args.start_frame}, recovered/frozen at {args.freeze_frame}, tail ends before {end_frame}')
+        print(
+            'Frames: '
+            f'slices start at source frame {args.source_start_frame}, '
+            f'recovered/frozen at source frame {args.source_freeze_frame}, '
+            f'tail ends at source frame {args.source_end_frame}'
+        )
         print(f'RIFE factors: slices={args.stretch_ghost}, freeze_orbit={args.stretch_freeze}')
         print(f'Freeze orbit interpolation: {args.freeze_interp_mode}')
 
@@ -248,8 +291,10 @@ def main():
             stretch_freeze=args.stretch_freeze,
             stretch_tail=args.stretch_tail,
             freeze_interp_mode=args.freeze_interp_mode,
+            tail_camera_id=args.tail_camera_id,
             background_mode=args.background_mode,
             recovery_transition_frames=args.recovery_transition_frames,
+            recovery_timing=args.recovery_timing,
             initial_canvas_mode=args.initial_canvas_mode,
             initial_subject_patch_mode=args.initial_subject_patch_mode,
             initial_subject_patch_frame=args.initial_subject_patch_frame,

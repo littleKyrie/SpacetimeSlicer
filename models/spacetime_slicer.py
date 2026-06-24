@@ -1,8 +1,12 @@
 import cv2
 import os
+import re
 import numpy as np
 import torch
 from models.rife_ncnn import NeuralSlowMotionWriter
+
+
+FRAME_DIR_PATTERN = re.compile(r'^\d+$')
 
 
 class SpacetimeSlicer:
@@ -15,29 +19,72 @@ class SpacetimeSlicer:
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         self.rife_interpolator = rife_interpolator
 
-        # 扫描所有子文件夹（帧）
-        self.subdirs = sorted([d for d in os.listdir(input_dir) if os.path.isdir(os.path.join(input_dir, d))])
+        # Only numeric subdirectories are frame directories. Generated helper
+        # folders such as 重命名数据/ and 原始图片/ must not be indexed as frames.
+        self.subdirs = sorted(
+            [
+                d for d in os.listdir(input_dir)
+                if os.path.isdir(os.path.join(input_dir, d)) and FRAME_DIR_PATTERN.fullmatch(d)
+            ],
+            key=lambda value: int(value),
+        )
 
         # 为每个机位存储帧路径
         self.frame_paths_dict = {}
+        self.frame_paths_by_frame_dict = {}
         for cam_id in self.camera_ids:
             frame_paths = []
+            frame_paths_by_frame = {}
             for subdir in self.subdirs:
                 frame_filename = f"{cam_id:03d}.jpg"
                 frame_path = os.path.join(input_dir, subdir, frame_filename)
                 if os.path.exists(frame_path):
+                    frame_idx = int(subdir) - 1
+                    frame_paths_by_frame[frame_idx] = frame_path
                     frame_paths.append(frame_path)
             self.frame_paths_dict[cam_id] = frame_paths
+            self.frame_paths_by_frame_dict[cam_id] = frame_paths_by_frame
 
-        # 总帧数取第一个机位的帧数
-        self.total_frames = len(self.frame_paths_dict[self.camera_ids[0]])
+        # 总帧数取第一个机位覆盖的实际帧号范围
+        start_cam_frames = self.frame_paths_by_frame_dict[self.camera_ids[0]]
+        self.total_frames = max(start_cam_frames.keys()) + 1 if start_cam_frames else 0
         print(f"找到 {self.total_frames} 帧")
         for cam_id in self.camera_ids:
             print(f"  机位 {cam_id}: {len(self.frame_paths_dict[cam_id])} 帧")
 
+    def has_frame(self, idx, camera_id):
+        frame_paths_by_frame = getattr(self, 'frame_paths_by_frame_dict', None)
+        if frame_paths_by_frame is not None and camera_id in frame_paths_by_frame:
+            return idx in frame_paths_by_frame[camera_id]
+        return idx < len(self.frame_paths_dict[camera_id])
+
+    def has_frame_range(self, start_idx, end_idx, camera_id):
+        return all(self.has_frame(frame_idx, camera_id) for frame_idx in range(start_idx, end_idx))
+
+    def resolve_tail_camera_id(self, camera_ids, freeze_idx, effect_end_idx, requested_tail_camera_id=None):
+        start_cam = camera_ids[0]
+        end_cam = camera_ids[-1]
+        tail_start_idx = freeze_idx + 1
+        if tail_start_idx >= effect_end_idx:
+            return end_cam if requested_tail_camera_id is None else requested_tail_camera_id
+
+        if requested_tail_camera_id is not None:
+            return requested_tail_camera_id
+
+        if self.has_frame_range(tail_start_idx, effect_end_idx, end_cam):
+            return end_cam
+        if self.has_frame_range(tail_start_idx, effect_end_idx, start_cam):
+            return start_cam
+        return end_cam
+
     def read_frame(self, idx, camera_id=None):
         if camera_id is None:
             camera_id = self.camera_ids[0]
+        frame_paths_by_frame = getattr(self, 'frame_paths_by_frame_dict', None)
+        if frame_paths_by_frame is not None and camera_id in frame_paths_by_frame:
+            if idx not in frame_paths_by_frame[camera_id]:
+                raise ValueError(f"Camera {camera_id} does not contain frame {idx}")
+            return cv2.imread(frame_paths_by_frame[camera_id][idx])
         return cv2.imread(self.frame_paths_dict[camera_id][idx])
 
     def write_frame_repeat(self, out, frame, stretch=1):
@@ -110,12 +157,18 @@ class SpacetimeSlicer:
             return fade_duration_frames
         return min(effect_frame_count, max(2, self.fps // 2))
 
-    def resolve_effect_schedule(self, effect_start_idx, freeze_idx, fade_duration_frames):
+    def resolve_effect_schedule(self, effect_start_idx, freeze_idx, fade_duration_frames,
+                                recovery_timing='after_freeze'):
         effect_frame_count = freeze_idx - effect_start_idx + 1
         if effect_frame_count < 2:
             raise ValueError("Expected at least two frames between effect_start_idx and freeze_idx")
+        if recovery_timing not in ('after_freeze', 'before_freeze'):
+            raise ValueError(f"Unknown recovery timing: {recovery_timing}")
 
         total_fade_frames = self.resolve_fade_duration(effect_frame_count, fade_duration_frames)
+        if recovery_timing == 'after_freeze':
+            return freeze_idx, total_fade_frames
+
         max_fade_frames = effect_frame_count - 1
         if total_fade_frames > max_fade_frames:
             if fade_duration_frames is not None:
@@ -452,7 +505,9 @@ class SpacetimeSlicer:
                  stretch_head=1, stretch_ghost=1, stretch_fade=1,
                  stretch_freeze=1, stretch_tail=1,
                  background_mode='freeze', recovery_transition_frames=3,
+                 recovery_timing='after_freeze',
                  freeze_interp_mode='rife',
+                 tail_camera_id=None,
                  initial_canvas_mode='patched_start',
                  initial_subject_patch_mode='freeze',
                  initial_subject_patch_frame=None,
@@ -503,24 +558,36 @@ class SpacetimeSlicer:
             raise ValueError("fade_duration_frames must be at least 1")
         if recovery_transition_frames < 0:
             raise ValueError("recovery_transition_frames must not be negative")
+        if recovery_timing not in ('after_freeze', 'before_freeze'):
+            raise ValueError(f"Unknown recovery timing: {recovery_timing}")
         if min(stretch_head, stretch_ghost, stretch_fade, stretch_freeze, stretch_tail) < 1:
             raise ValueError("stretch values must be at least 1")
         if freeze_interp_mode not in ('rife', 'repeat', 'blend'):
             raise ValueError(f"Unknown freeze interpolation mode: {freeze_interp_mode}")
         start_cam = camera_ids[0]
         end_cam = camera_ids[-1]
-        if freeze_idx >= len(self.frame_paths_dict[start_cam]):
+        tail_cam = self.resolve_tail_camera_id(
+            camera_ids,
+            freeze_idx,
+            effect_end_idx,
+            requested_tail_camera_id=tail_camera_id,
+        )
+        if not self.has_frame(freeze_idx, start_cam):
             raise ValueError(f"Camera {start_cam} does not contain freeze frame {freeze_idx}")
         for camera_id in camera_ids:
-            if freeze_idx >= len(self.frame_paths_dict[camera_id]):
+            if not self.has_frame(freeze_idx, camera_id):
                 raise ValueError(f"Camera {camera_id} does not contain freeze frame {freeze_idx}")
-        if effect_end_idx > len(self.frame_paths_dict[end_cam]):
-            raise ValueError(f"Camera {end_cam} does not contain frames up to {effect_end_idx - 1}")
+        for frame_idx in range(0, freeze_idx + 1):
+            if not self.has_frame(frame_idx, start_cam):
+                raise ValueError(f"Camera {start_cam} does not contain frame {frame_idx}")
+        for frame_idx in range(freeze_idx + 1, effect_end_idx):
+            if not self.has_frame(frame_idx, tail_cam):
+                raise ValueError(f"Camera {tail_cam} does not contain tail frame {frame_idx}")
 
         patch_suffix = initial_subject_patch_mode
         if initial_subject_patch_mode == 'frame':
             patch_suffix = f"frame{freeze_idx if initial_subject_patch_frame is None else initial_subject_patch_frame}"
-        stretch_suffix = f"_sh{stretch_head}_sg{stretch_ghost}_sfd{stretch_fade}_sfz{stretch_freeze}_st{stretch_tail}_rife_fim{freeze_interp_mode}_patch{patch_suffix}_canvas{initial_canvas_mode}_base{effect_base_mode}_live{live_subject_alpha_threshold}_recoverybg{background_mode}_rt{recovery_transition_frames}"
+        stretch_suffix = f"_sh{stretch_head}_sg{stretch_ghost}_sfd{stretch_fade}_sfz{stretch_freeze}_st{stretch_tail}_rife_fim{freeze_interp_mode}_tail{tail_cam}_patch{patch_suffix}_canvas{initial_canvas_mode}_base{effect_base_mode}_live{live_subject_alpha_threshold}_recoverybg{background_mode}_rtime{recovery_timing}_rt{recovery_transition_frames}"
         run_name = f"freeze_{start_cam}_to_{end_cam}_seq{len(camera_ids)}_s{effect_start_idx}_f{freeze_idx}_e{effect_end_idx}{stretch_suffix}"
         output_dir = os.path.join(self.output_root, run_name)
         os.makedirs(output_dir, exist_ok=True)
@@ -541,7 +608,7 @@ class SpacetimeSlicer:
         permanent_indices = []
 
         slice_end_idx, total_fade_frames = self.resolve_effect_schedule(
-            effect_start_idx, freeze_idx, fade_duration_frames
+            effect_start_idx, freeze_idx, fade_duration_frames, recovery_timing
         )
 
         # ============ 1. 写入片头 ============
@@ -554,7 +621,10 @@ class SpacetimeSlicer:
         # ============ 2. 特效段: 固定机位 + 残影 + 透明度渐变 ============
         print(f"\n特效段: 机位 {start_cam} ({effect_start_idx} -> {slice_end_idx})")
         print(f"   残影透明度: {ghost_opacity_start:.0%} -> {ghost_opacity_end:.0%}, 插帧 ×{stretch_ghost}")
-        print(f"   回收窗口: {slice_end_idx + 1} -> {freeze_idx} ({total_fade_frames} 帧)")
+        if recovery_timing == 'before_freeze':
+            print(f"   回收窗口: {slice_end_idx + 1} -> {freeze_idx} ({total_fade_frames} 帧)")
+        else:
+            print(f"   回收窗口: freeze 帧之后插入 {total_fade_frames} 帧")
         print("   特效底图模式: source（原始视频帧 + 已捕获切片）")
         source_start_frame = self.read_frame(effect_start_idx, start_cam).copy()
         initial_subject_replacement = self.resolve_initial_subject_replacement(
@@ -614,9 +684,9 @@ class SpacetimeSlicer:
 
         # ============ 5. 继续播放: 凝结帧之后 -> 结束帧 ============
         if freeze_idx + 1 < effect_end_idx:
-            print(f"\n继续播放: 机位 {end_cam} ({freeze_idx + 1} -> {effect_end_idx - 1}), 插帧 ×{stretch_tail}")
+            print(f"\n继续播放: 机位 {tail_cam} ({freeze_idx + 1} -> {effect_end_idx - 1}), 插帧 ×{stretch_tail}")
             for i in range(freeze_idx + 1, effect_end_idx):
-                self.write_frame_repeat(out, self.read_frame(i, end_cam), stretch_tail)
+                self.write_frame_repeat(out, self.read_frame(i, tail_cam), stretch_tail)
                 print(f"  > 播放帧 {i}/{effect_end_idx - 1}", end='\r')
             print()
 
@@ -630,4 +700,4 @@ class SpacetimeSlicer:
         print(f"   片尾淡出: {total_fade_frames} 帧 ×{stretch_fade}")
         print(f"   凝结转场: {len(camera_ids)} 个机位视角 ×{stretch_freeze}")
         if freeze_idx + 1 < effect_end_idx:
-            print(f"   继续播放: {freeze_idx + 1} -> {effect_end_idx - 1} ({effect_end_idx - freeze_idx - 1} 帧, 机位 {end_cam}, ×{stretch_tail})")
+            print(f"   继续播放: {freeze_idx + 1} -> {effect_end_idx - 1} ({effect_end_idx - freeze_idx - 1} 帧, 机位 {tail_cam}, ×{stretch_tail})")

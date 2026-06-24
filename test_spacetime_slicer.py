@@ -1,9 +1,11 @@
 import unittest
+import tempfile
+from pathlib import Path
 
 import cv2
 import numpy as np
 
-from build_spacetime_slicer import parse_frame_ids
+from build_spacetime_slicer import build_parser, normalize_cli_frame_args, parse_frame_ids
 from models.spacetime_slicer import SpacetimeSlicer
 
 
@@ -45,6 +47,99 @@ def make_slicer(frames, rife_interpolator=None):
 
 
 class SpacetimeSlicerTest(unittest.TestCase):
+    def test_cli_frame_ids_are_one_based_source_frame_ids(self):
+        args = build_parser().parse_args([
+            '--input_dir', 'data',
+            '--output_dir', 'results',
+            '--start_frame', '25',
+            '--freeze_frame', '125',
+            '--end_frame', '149',
+            '--initial_subject_patch_frame', '125',
+        ])
+
+        normalize_cli_frame_args(args)
+
+        self.assertEqual(args.start_frame, 24)
+        self.assertEqual(args.freeze_frame, 124)
+        self.assertEqual(args.end_frame, 149)
+        self.assertEqual(args.initial_subject_patch_frame, 124)
+        self.assertEqual(args.source_start_frame, 25)
+        self.assertEqual(args.source_freeze_frame, 125)
+        self.assertEqual(args.source_end_frame, 149)
+
+    def test_cli_frame_ids_reject_zero(self):
+        args = build_parser().parse_args([
+            '--input_dir', 'data',
+            '--output_dir', 'results',
+            '--start_frame', '0',
+            '--freeze_frame', '125',
+            '--end_frame', '149',
+        ])
+
+        with self.assertRaisesRegex(ValueError, 'start_frame'):
+            normalize_cli_frame_args(args)
+
+    def test_cli_accepts_tail_camera_id(self):
+        args = build_parser().parse_args([
+            '--input_dir', 'data',
+            '--output_dir', 'results',
+            '--freeze_frame', '125',
+            '--end_frame', '149',
+            '--tail_camera_id', '1',
+        ])
+
+        self.assertEqual(args.tail_camera_id, 1)
+        self.assertEqual(args.recovery_timing, 'after_freeze')
+
+    def test_cli_accepts_before_freeze_recovery_timing(self):
+        args = build_parser().parse_args([
+            '--input_dir', 'data',
+            '--output_dir', 'results',
+            '--freeze_frame', '125',
+            '--end_frame', '149',
+            '--recovery_timing', 'before_freeze',
+        ])
+
+        self.assertEqual(args.recovery_timing, 'before_freeze')
+
+    def test_sparse_frame_index_ignores_non_frame_directories(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for dirname in ['0001', '0002', '0125', '重命名数据']:
+                (root / dirname).mkdir()
+            (root / '0001' / '001.jpg').write_bytes(b'')
+            (root / '0002' / '001.jpg').write_bytes(b'')
+            (root / '0125' / '001.jpg').write_bytes(b'')
+            (root / '0125' / '002.jpg').write_bytes(b'')
+            (root / '重命名数据' / '001.jpg').write_bytes(b'')
+            (root / '重命名数据' / '002.jpg').write_bytes(b'')
+
+            slicer = SpacetimeSlicer(str(root), str(root / 'out'), camera_ids=[1, 2])
+
+            self.assertEqual(slicer.total_frames, 125)
+            self.assertEqual(len(slicer.frame_paths_dict[1]), 3)
+            self.assertEqual(len(slicer.frame_paths_dict[2]), 1)
+            self.assertTrue(slicer.has_frame(124, 2))
+            self.assertFalse(slicer.has_frame(125, 2))
+
+    def test_tail_camera_defaults_to_first_camera_when_sparse_views_have_no_tail(self):
+        slicer = SpacetimeSlicer.__new__(SpacetimeSlicer)
+        slicer.frame_paths_dict = {
+            1: list(range(149)),
+            90: [124],
+        }
+
+        self.assertEqual(slicer.resolve_tail_camera_id([1, 90], 124, 149), 1)
+
+    def test_tail_camera_defaults_to_last_camera_when_it_has_tail_frames(self):
+        slicer = SpacetimeSlicer.__new__(SpacetimeSlicer)
+        slicer.frame_paths_dict = {
+            1: list(range(149)),
+            90: list(range(149)),
+        }
+
+        self.assertEqual(slicer.resolve_tail_camera_id([1, 90], 124, 149), 90)
+
     def test_parse_frame_ids_accepts_ranges_and_lists(self):
         self.assertEqual(parse_frame_ids('115:117'), [115, 116, 117])
         self.assertEqual(parse_frame_ids('115,130'), [115, 130])
@@ -206,30 +301,52 @@ class SpacetimeSlicerTest(unittest.TestCase):
 
         self.assertTrue(np.array_equal(background, np.zeros((1, 1, 3), dtype=np.uint8)))
 
-    def test_effect_schedule_reserves_default_recovery_before_freeze_frame(self):
+    def test_effect_schedule_defaults_to_recovery_after_freeze_frame(self):
         slicer = SpacetimeSlicer.__new__(SpacetimeSlicer)
         slicer.fps = 25
 
         slice_end_idx, total_fade_frames = slicer.resolve_effect_schedule(115, 227, None)
 
+        self.assertEqual(slice_end_idx, 227)
+        self.assertEqual(total_fade_frames, 12)
+
+    def test_effect_schedule_can_reserve_recovery_before_freeze_frame(self):
+        slicer = SpacetimeSlicer.__new__(SpacetimeSlicer)
+        slicer.fps = 25
+
+        slice_end_idx, total_fade_frames = slicer.resolve_effect_schedule(
+            115, 227, None, recovery_timing='before_freeze'
+        )
+
         self.assertEqual(slice_end_idx, 215)
         self.assertEqual(total_fade_frames, 12)
 
-    def test_effect_schedule_uses_explicit_recovery_duration(self):
+    def test_effect_schedule_before_freeze_uses_explicit_recovery_duration(self):
+        slicer = SpacetimeSlicer.__new__(SpacetimeSlicer)
+        slicer.fps = 25
+
+        slice_end_idx, total_fade_frames = slicer.resolve_effect_schedule(
+            115, 227, 20, recovery_timing='before_freeze'
+        )
+
+        self.assertEqual(slice_end_idx, 207)
+        self.assertEqual(total_fade_frames, 20)
+
+    def test_effect_schedule_after_freeze_uses_explicit_recovery_duration(self):
         slicer = SpacetimeSlicer.__new__(SpacetimeSlicer)
         slicer.fps = 25
 
         slice_end_idx, total_fade_frames = slicer.resolve_effect_schedule(115, 227, 20)
 
-        self.assertEqual(slice_end_idx, 207)
+        self.assertEqual(slice_end_idx, 227)
         self.assertEqual(total_fade_frames, 20)
 
-    def test_effect_schedule_rejects_recovery_that_leaves_no_slice_frames(self):
+    def test_effect_schedule_before_freeze_rejects_recovery_that_leaves_no_slice_frames(self):
         slicer = SpacetimeSlicer.__new__(SpacetimeSlicer)
         slicer.fps = 25
 
         with self.assertRaisesRegex(ValueError, 'slice generation'):
-            slicer.resolve_effect_schedule(115, 227, 113)
+            slicer.resolve_effect_schedule(115, 227, 113, recovery_timing='before_freeze')
 
     def test_slice_generation_uses_rife_for_person_action(self):
         frames = [
