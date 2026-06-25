@@ -8,7 +8,7 @@
   "end_frame": null,
   "ghost_interval": 20,
   "edge_feather": 0,
-  "fade_duration_frames": 10,
+  "fade_duration_frames": 12,
   "ghost_opacity_start": 0.2,
   "ghost_opacity_end": 1.0,
   "initial_subject_patch_mode": "freeze",

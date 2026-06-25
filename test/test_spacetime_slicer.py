@@ -342,6 +342,47 @@ class SpacetimeSlicerTest(unittest.TestCase):
         self.assertEqual(ghost['alpha'][0].tolist(), [0, 0, 255, 0, 0])
         self.assertEqual(int(ghost['frame'][0, 2, 0]), 150)
 
+    def test_recovery_preserves_each_cutout_aspect_ratio(self):
+        slicer = SpacetimeSlicer.__new__(SpacetimeSlicer)
+        vertical_alpha = np.zeros((9, 9), dtype=np.uint8)
+        vertical_alpha[2:7, 4] = 255
+        horizontal_alpha = np.zeros((9, 9), dtype=np.uint8)
+        horizontal_alpha[4, 1:8] = 255
+        all_ghosts = [
+            {
+                'frame': np.full((9, 9, 3), 100, dtype=np.uint8),
+                'alpha': vertical_alpha,
+            },
+            {
+                'frame': np.full((9, 9, 3), 200, dtype=np.uint8),
+                'alpha': horizontal_alpha,
+            },
+        ]
+
+        ghost = slicer.interpolate_ghost(all_ghosts, 0.5)
+        x, y, width, height = cv2.boundingRect(
+            (ghost['alpha'] > 0).astype(np.uint8)
+        )
+
+        self.assertEqual((x, y, width, height), (1, 2, 7, 5))
+
+    def test_recovery_geometry_ignores_disconnected_alpha_noise(self):
+        slicer = SpacetimeSlicer.__new__(SpacetimeSlicer)
+        alpha = np.zeros((10, 20), dtype=np.uint8)
+        alpha[2:8, 3:7] = 255
+        alpha[5, 19] = 255
+        ghost = {
+            'frame': np.zeros((10, 20, 3), dtype=np.uint8),
+            'alpha': alpha,
+        }
+
+        geometry = slicer.get_ghost_geometry(ghost)
+
+        np.testing.assert_array_equal(
+            geometry,
+            np.array([5.0, 5.0, 4.0, 6.0], dtype=np.float32),
+        )
+
     def test_temporal_median_background_removes_transient_subject(self):
         frames = [
             np.zeros((1, 1, 3), dtype=np.uint8),

@@ -184,17 +184,27 @@ class SpacetimeSlicer:
         if 'geometry' in ghost:
             return ghost['geometry']
 
-        mask_points = cv2.findNonZero((ghost['alpha'] > 8).astype(np.uint8))
-        if mask_points is None:
+        binary_alpha = (ghost['alpha'] > 8).astype(np.uint8)
+        component_count, _, component_stats, _ = cv2.connectedComponentsWithStats(
+            binary_alpha, connectivity=8
+        )
+        if component_count <= 1:
             h, w = ghost['alpha'].shape
             geometry = np.array([w / 2.0, h / 2.0, float(w), float(h)], dtype=np.float32)
         else:
-            x, y, w, h = cv2.boundingRect(mask_points)
+            primary_label = 1 + int(
+                np.argmax(component_stats[1:, cv2.CC_STAT_AREA])
+            )
+            x = component_stats[primary_label, cv2.CC_STAT_LEFT]
+            y = component_stats[primary_label, cv2.CC_STAT_TOP]
+            w = component_stats[primary_label, cv2.CC_STAT_WIDTH]
+            h = component_stats[primary_label, cv2.CC_STAT_HEIGHT]
             geometry = np.array([x + w / 2.0, y + h / 2.0, float(w), float(h)], dtype=np.float32)
         ghost['geometry'] = geometry
         return geometry
 
-    def align_ghost_to_geometry(self, ghost, target_geometry):
+    def align_ghost_to_center(self, ghost, target_center):
+        """Translate a cutout to the interpolated center without changing its body proportions."""
         frame_h, frame_w = ghost['alpha'].shape
         source_geometry = self.get_ghost_geometry(ghost)
         source_w = max(1, int(round(source_geometry[2])))
@@ -206,22 +216,18 @@ class SpacetimeSlicer:
         source_w = min(source_w, frame_w - source_x)
         source_h = min(source_h, frame_h - source_y)
 
-        target_w = max(1, int(round(target_geometry[2])))
-        target_h = max(1, int(round(target_geometry[3])))
-        target_x = int(round(target_geometry[0] - target_w / 2.0))
-        target_y = int(round(target_geometry[1] - target_h / 2.0))
+        target_x = int(round(target_center[0] - source_w / 2.0))
+        target_y = int(round(target_center[1] - source_h / 2.0))
 
         frame_crop = ghost['frame'][source_y:source_y + source_h, source_x:source_x + source_w]
         alpha_crop = ghost['alpha'][source_y:source_y + source_h, source_x:source_x + source_w]
-        resized_frame = cv2.resize(frame_crop, (target_w, target_h), interpolation=cv2.INTER_LINEAR)
-        resized_alpha = cv2.resize(alpha_crop, (target_w, target_h), interpolation=cv2.INTER_LINEAR)
 
         aligned_frame = np.zeros_like(ghost['frame'])
         aligned_alpha = np.zeros_like(ghost['alpha'])
         dst_x0 = max(0, target_x)
         dst_y0 = max(0, target_y)
-        dst_x1 = min(frame_w, target_x + target_w)
-        dst_y1 = min(frame_h, target_y + target_h)
+        dst_x1 = min(frame_w, target_x + source_w)
+        dst_y1 = min(frame_h, target_y + source_h)
         if dst_x0 >= dst_x1 or dst_y0 >= dst_y1:
             return aligned_frame, aligned_alpha
 
@@ -229,8 +235,8 @@ class SpacetimeSlicer:
         src_y0 = dst_y0 - target_y
         src_x1 = src_x0 + (dst_x1 - dst_x0)
         src_y1 = src_y0 + (dst_y1 - dst_y0)
-        aligned_frame[dst_y0:dst_y1, dst_x0:dst_x1] = resized_frame[src_y0:src_y1, src_x0:src_x1]
-        aligned_alpha[dst_y0:dst_y1, dst_x0:dst_x1] = resized_alpha[src_y0:src_y1, src_x0:src_x1]
+        aligned_frame[dst_y0:dst_y1, dst_x0:dst_x1] = frame_crop[src_y0:src_y1, src_x0:src_x1]
+        aligned_alpha[dst_y0:dst_y1, dst_x0:dst_x1] = alpha_crop[src_y0:src_y1, src_x0:src_x1]
         return aligned_frame, aligned_alpha
 
     def process_segment(self, strategy, camera_id, start_idx, end_idx, ghost_interval, edge_feather,
@@ -378,11 +384,12 @@ class SpacetimeSlicer:
             self.get_ghost_geometry(all_ghosts[p3_idx]),
             ratio,
         )
-        lower_frame, lower_alpha = self.align_ghost_to_geometry(
-            all_ghosts[lower_idx], target_geometry
+        target_center = target_geometry[:2]
+        lower_frame, lower_alpha = self.align_ghost_to_center(
+            all_ghosts[lower_idx], target_center
         )
-        upper_frame, upper_alpha = self.align_ghost_to_geometry(
-            all_ghosts[upper_idx], target_geometry
+        upper_frame, upper_alpha = self.align_ghost_to_center(
+            all_ghosts[upper_idx], target_center
         )
         lower_alpha_f = lower_alpha.astype(np.float32) / 255.0
         upper_alpha_f = upper_alpha.astype(np.float32) / 255.0
