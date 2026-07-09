@@ -1,19 +1,101 @@
+import json
+import tempfile
 import unittest
 from pathlib import Path
 
-from batch_run import parse_args, run_pipeline
+from batch_run import REPO_ROOT, parse_args, run_pipeline
 
 
 class BatchRunTest(unittest.TestCase):
-    def test_source_only_uses_same_name_under_current_directory(self):
+    def make_batch_config(self, temp_dir, data_root):
+        config_path = Path(temp_dir) / 'batch.json'
+        config = {
+            'reorganize_config': str(REPO_ROOT / 'configs' / 'reorganize_frame_images.json'),
+            'slicer_config': str(REPO_ROOT / 'configs' / 'spacetime_slicer.json'),
+            'data_root': str(data_root),
+            'output_dir': None,
+        }
+        config_path.write_text(json.dumps(config), encoding='utf-8')
+        return config_path
+
+    def test_source_only_uses_slicers_dir_next_to_input(self):
         args, slicer_args = parse_args(['-s', './data/QP-2026-06-23-175636'])
 
-        self.assertEqual(args.source_dir, './data/QP-2026-06-23-175636')
+        expected_input = REPO_ROOT / 'data' / 'QP-2026-06-23-175636'
+        self.assertEqual(Path(args.datasets_to_process[0]), expected_input)
         self.assertEqual(
             Path(args.output_dir),
-            Path.cwd() / 'results' / 'QP-2026-06-23-175636',
+            REPO_ROOT / 'data' / 'Slicers' / 'QP-2026-06-23-175636',
         )
         self.assertEqual(slicer_args, [])
+
+    def test_sub_dir_selects_all_unprocessed_datasets_in_time_order(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            data_root = Path(temp_dir) / 'data'
+            (data_root / '0630' / 'QPA-2026-06-30-161131').mkdir(parents=True)
+            (data_root / '0630' / 'QPB-2026-06-30-172000').mkdir(parents=True)
+            (data_root / '0630' / 'QPC-2026-06-30-181500').mkdir(parents=True)
+            done_dir = data_root / '0630' / 'Slicers' / 'QPB-2026-06-30-172000'
+            done_dir.mkdir(parents=True)
+            (done_dir / 'slicer.mp4').write_bytes(b'done')
+            config_path = self.make_batch_config(temp_dir, data_root)
+
+            args, _ = parse_args(['--config', str(config_path), '--sub_dir', '0630'])
+
+            self.assertEqual(
+                [Path(path) for path in args.datasets_to_process],
+                [
+                    (data_root / '0630' / 'QPA-2026-06-30-161131').resolve(),
+                    (data_root / '0630' / 'QPC-2026-06-30-181500').resolve(),
+                ],
+            )
+
+    def test_datasets_selects_only_named_unprocessed_dataset(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            data_root = Path(temp_dir) / 'data'
+            selected = data_root / '0630' / 'QPA-2026-06-30-161131'
+            selected.mkdir(parents=True)
+            (data_root / '0630' / 'QPB-2026-06-30-172000').mkdir(parents=True)
+            config_path = self.make_batch_config(temp_dir, data_root)
+
+            args, _ = parse_args([
+                '--config', str(config_path),
+                '--sub_dir', '0630',
+                '--datasets', selected.name,
+            ])
+
+            self.assertEqual(
+                [Path(path) for path in args.datasets_to_process],
+                [selected.resolve()],
+            )
+
+    def test_force_with_multiple_datasets_selects_only_specified_names(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            data_root = Path(temp_dir) / 'data'
+            for name in (
+                'QPA-2026-06-30-161131',
+                'QPB-2026-06-30-172000',
+                'QPC-2026-06-30-181500',
+            ):
+                (data_root / '0630' / name).mkdir(parents=True)
+            config_path = self.make_batch_config(temp_dir, data_root)
+
+            args, _ = parse_args([
+                '--config', str(config_path),
+                '--sub_dir', '0630',
+                '--force',
+                '--datasets',
+                'QPA-2026-06-30-161131',
+                'QPC-2026-06-30-181500',
+            ])
+
+            self.assertEqual(
+                [Path(path) for path in args.datasets_to_process],
+                [
+                    (data_root / '0630' / 'QPA-2026-06-30-161131').resolve(),
+                    (data_root / '0630' / 'QPC-2026-06-30-181500').resolve(),
+                ],
+            )
 
     def test_routes_reorganize_and_slicer_overrides(self):
         args, slicer_args = parse_args([
@@ -80,7 +162,7 @@ class BatchRunTest(unittest.TestCase):
         calls = []
 
         def fake_checker(input_dir, **kwargs):
-            self.assertEqual(input_dir, './data/source')
+            self.assertEqual(Path(input_dir), REPO_ROOT / 'data' / 'source')
             self.assertEqual(kwargs['pre_frame_count'], 2)
             self.assertEqual(kwargs['camera_count'], 2)
             return True

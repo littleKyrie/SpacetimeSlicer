@@ -591,15 +591,18 @@ class SpacetimeSlicer:
             if not self.has_frame(frame_idx, tail_cam):
                 raise ValueError(f"Camera {tail_cam} does not contain tail frame {frame_idx}")
 
-        patch_suffix = initial_subject_patch_mode
-        if initial_subject_patch_mode == 'frame':
-            patch_suffix = f"frame{freeze_idx if initial_subject_patch_frame is None else initial_subject_patch_frame}"
-        stretch_suffix = f"_sh{stretch_head}_sg{stretch_ghost}_sfd{stretch_fade}_sfz{stretch_freeze}_st{stretch_tail}_rife_fim{freeze_interp_mode}_tail{tail_cam}_patch{patch_suffix}_canvas{initial_canvas_mode}_base{effect_base_mode}_live{live_subject_alpha_threshold}_recoverybg{background_mode}_rtime{recovery_timing}_rt{recovery_transition_frames}"
-        run_name = f"freeze_{start_cam}_to_{end_cam}_seq{len(camera_ids)}_s{effect_start_idx}_f{freeze_idx}_e{effect_end_idx}{stretch_suffix}"
-        output_dir = os.path.join(self.output_root, run_name)
+        # Old verbose run directory retained for reference:
+        # patch_suffix = initial_subject_patch_mode
+        # if initial_subject_patch_mode == 'frame':
+        #     patch_suffix = f"frame{freeze_idx if initial_subject_patch_frame is None else initial_subject_patch_frame}"
+        # stretch_suffix = f"_sh{stretch_head}_sg{stretch_ghost}_sfd{stretch_fade}_sfz{stretch_freeze}_st{stretch_tail}_rife_fim{freeze_interp_mode}_tail{tail_cam}_patch{patch_suffix}_canvas{initial_canvas_mode}_base{effect_base_mode}_live{live_subject_alpha_threshold}_recoverybg{background_mode}_rtime{recovery_timing}_rt{recovery_transition_frames}"
+        # run_name = f"freeze_{start_cam}_to_{end_cam}_seq{len(camera_ids)}_s{effect_start_idx}_f{freeze_idx}_e{effect_end_idx}{stretch_suffix}"
+        # output_dir = os.path.join(self.output_root, run_name)
+        output_dir = self.output_root
         os.makedirs(output_dir, exist_ok=True)
 
         video_path = os.path.join(output_dir, "slicer.mp4")
+        print(f"Output video: {video_path}")
 
         sample_frame = self.read_frame(0, start_cam)
         h, w = sample_frame.shape[:2]

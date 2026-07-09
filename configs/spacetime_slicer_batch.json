@@ -1,5 +1,6 @@
 {
   "reorganize_config": "reorganize_frame_images.json",
   "slicer_config": "spacetime_slicer.json",
+  "data_root": "data",
   "output_dir": null
 }
