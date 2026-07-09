@@ -7,3 +7,4 @@ __pycache__/
 .agents/
 .codex_tmp/
 .vscode/
+third-party/
