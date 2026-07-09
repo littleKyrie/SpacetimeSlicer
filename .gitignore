@@ -1,6 +1,10 @@
 checkpoints/
 models/__pycache__/
 *.pyc
-*.jpg
-*.png
-*.mp4
+.agents/
+.codex_tmp/
+.vscode/
+results/
+data/
+test/
+utils/__pycache__/
