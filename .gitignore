@@ -8,3 +8,4 @@ __pycache__/
 .codex_tmp/
 .vscode/
 checkpoints/
+third_party/rife-ncnn-vulkan/
