@@ -8,3 +8,4 @@ results/
 data/
 test/
 utils/__pycache__/
+third_party/rife-ncnn-vulkan/
