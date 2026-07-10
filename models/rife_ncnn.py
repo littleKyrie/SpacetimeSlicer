@@ -2,8 +2,11 @@ import os
 import shutil
 import subprocess
 import tempfile
+from pathlib import Path
 
 import cv2
+
+_REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
 class RifeNcnnInterpolator:
@@ -21,6 +24,8 @@ class RifeNcnnInterpolator:
         candidates = [
             executable,
             os.environ.get('RIFE_NCNN_EXE'),
+            str(_REPO_ROOT / 'third_party' / 'rife-ncnn-vulkan' / 'rife-ncnn-vulkan.exe'),
+            str(_REPO_ROOT / 'third_party' / 'rife-ncnn-vulkan' / 'rife-ncnn-vulkan'),
             os.path.join('third_party', 'rife-ncnn-vulkan', 'rife-ncnn-vulkan.exe'),
             os.path.join('third_party', 'rife-ncnn-vulkan', 'rife-ncnn-vulkan'),
             os.path.join('tools', 'rife-ncnn-vulkan', 'rife-ncnn-vulkan.exe'),

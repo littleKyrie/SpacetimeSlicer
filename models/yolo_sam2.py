@@ -1,3 +1,5 @@
+from pathlib import Path
+
 from ultralytics import YOLO
 from third_party import sam2
 from sam2.build_sam import build_sam2
@@ -6,20 +8,20 @@ from sam2.sam2_image_predictor import SAM2ImagePredictor
 # Model interface
 from models.seg_strategy import *
 
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+
 
 class YOLO_SAM2_Strategy(SegmentationStrategy):
     """YOLOv8 边界膨胀 + SAM 2 单帧分割方案"""
     def __init__(self, device, expand_ratio=0.4): # 扩大 padding 以包容扇子
         print(f">> 初始化 YOLO+SAM2 分割器 (Padding={expand_ratio})...")
-        
+
         self.device = device
         self.expand_ratio = expand_ratio
-        # self.yolo_model = YOLO('yolov8n.pt')
-        self.yolo_model = YOLO('./checkpoints/yolo/yolov8n.pt')
-        
-        # 请确保路径正确
-        sam2_checkpoint = "checkpoints/sam2/sam2.1_hiera_large.pt"
-        sam2_model_cfg = "configs/sam2.1/sam2.1_hiera_l.yaml"
+        self.yolo_model = YOLO(str(_REPO_ROOT / 'checkpoints' / 'yolo' / 'yolov8n.pt'))
+
+        sam2_checkpoint = str(_REPO_ROOT / 'checkpoints' / 'sam2' / 'sam2.1_hiera_large.pt')
+        sam2_model_cfg = str(_REPO_ROOT / 'configs' / 'sam2.1' / 'sam2.1_hiera_l.yaml')
         sam2_model = build_sam2(sam2_model_cfg, sam2_checkpoint, device=device)
         self.predictor = SAM2ImagePredictor(sam2_model)
 

@@ -1,3 +1,5 @@
+from pathlib import Path
+
 # Model interface
 from models.seg_strategy import *
 
@@ -7,7 +9,15 @@ class RVMStrategy(SegmentationStrategy):
     def __init__(self, device):
         print(">> 初始化 RVM 分割器...")
         self.device = device
-        self.model = torch.hub.load("C:\\Users\\Administrator\\.cache\\torch\\hub\\PeterL1n_RobustVideoMatting_master", "resnet50", source='local').to(self.device).eval()
+        repository = Path(__file__).resolve().parents[1] / "third_party" / "RobustVideoMatting"
+        if not repository.is_dir():
+            raise FileNotFoundError(
+                f"RobustVideoMatting repository not found: {repository}. "
+                "Run setup.ps1 first."
+            )
+        self.model = torch.hub.load(
+            str(repository), "resnet50", source='local'
+        ).to(self.device).eval()
         self.rec = [None] * 4
 
     def process_frame(self, current_img, current_idx):
