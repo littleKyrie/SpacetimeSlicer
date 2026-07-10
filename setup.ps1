@@ -19,6 +19,10 @@ $CheckpointRoot = Join-Path $RepoRoot "checkpoints"
 # Suppress uv progress bars (they go to stderr and trip PowerShell's error handling)
 $env:UV_NO_PROGRESS = "1"
 
+# Network resilience: increase timeout and use Tsinghua mirror (much faster inside China)
+$env:UV_HTTP_TIMEOUT = "300"
+$env:UV_INDEX_URL = "https://pypi.tuna.tsinghua.edu.cn/simple"
+
 # Resolve the venv directory — relative paths are relative to the repo root.
 if ([System.IO.Path]::IsPathRooted($EnvironmentName)) {
     $VenvPath = $EnvironmentName
@@ -26,7 +30,7 @@ if ([System.IO.Path]::IsPathRooted($EnvironmentName)) {
 else {
     $VenvPath = Join-Path $RepoRoot $EnvironmentName
 }
-$VenvPython = Join-Path $VenvPath "Scripts" "python.exe"
+$VenvPython = Join-Path $VenvPath "Scripts\python.exe"
 
 $SamRepository = "https://github.com/facebookresearch/sam2.git"
 $SamRevision = "2b90b9f5ceec907a1c18123530e92e794ad901a4"
