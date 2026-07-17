@@ -1,14 +1,29 @@
-# batch_run 批次发现、force 与统一输出目录计划
+# `batch_run.py` 双路径模式改造计划
 
-## 核心诉求
+## 1. 目标
 
-日常处理新数据时，不论数据在项目内还是共享盘，运行方式都保持一致：
+保持现有 `data_root` 为 `"data"` 等普通相对字符串时的读取、发现、跳过和输出方式不变；仅当用户配置或传入的 `data_root` 是绝对路径时，启用共享盘目录布局。
+
+日常命令仍统一为：
 
 ```powershell
-python batch_run.py --sub_dir 0630
+python batch_run.py --sub_dir 0717
 ```
 
-数据根目录只通过 JSON 中的 `data_root` 手动切换：
+两种模式的差异如下：
+
+| 模式 | `data_root` 示例 | 数据发现目录 | 默认输出根目录 |
+| --- | --- | --- | --- |
+| 现有相对路径模式 | `data` | `<repo>/data/0717` | `<repo>/data/0717/Slicers` |
+| 新增绝对路径模式 | `Y:/0717/关键帧` | `Y:/0717/关键帧` | `Y:/0717/风暴时刻输出` |
+
+本次只改变批次模式的路径推导。显式传入 `-s/--input_dir` 或 `--output_dir` 的单数据集用法继续保持最高优先级，不在本次需求中改变其既有语义。
+
+## 2. 明确的路径契约
+
+### 2.1 相对路径模式保持不变
+
+当配置中的原始 `data_root` 不是绝对路径，例如：
 
 ```json
 {
@@ -16,481 +31,356 @@ python batch_run.py --sub_dir 0630
 }
 ```
 
-或：
+执行：
+
+```powershell
+python batch_run.py --sub_dir 0717
+```
+
+仍按当前规则构建路径：
+
+```text
+batch_dir  = <repo>/data/0717
+input_dir  = <repo>/data/0717/<dataset_name>
+output_dir = <repo>/data/0717/Slicers/<dataset_name>
+video      = <repo>/data/0717/Slicers/<dataset_name>/slicer.mp4
+```
+
+这一分支继续沿用当前数据集发现规则、排序规则、`--datasets`、`--force` 和已有结果跳过规则，避免影响项目内已有工作流。
+
+### 2.2 绝对路径模式使用固定的共享盘布局
+
+当配置中的原始 `data_root` 是绝对数据目录，例如：
 
 ```json
 {
-  "data_root": "X:/关键帧"
+  "data_root": "Y:/0717/关键帧"
 }
 ```
 
-除了 `data_root` 的具体值不同，读取数据、发现新数据、构建输出目录、保存结果的逻辑完全一致。
+该绝对路径被视为一个路径模板：
 
-## 当前问题
+```text
+<固定前缀>/<日期部分>/<输入目录名>
+Y:/         0717       关键帧
+```
 
-当前 `batch_run.py` 中，`-s` / `--input_dir` 只表示输入目录。没有传 `--output_dir` 时，程序用输入目录最后一级名称推导输出目录：
+其中：
+
+- `--sub_dir` 只替换绝对路径中 `关键帧` 的直接父目录名，即日期部分。
+- 输入目录和输出目录必须使用同一个 `sub_dir` 日期值；两者不允许出现不同日期，也不能继续使用配置模板中的旧日期。
+- 盘符、日期目录之前的父路径以及末级输入目录名 `关键帧` 保持不变。
+- 输出目录与 `关键帧` 同级，目录名固定为 `风暴时刻输出`。
+- 不再把 `sub_dir` 追加到 `data_root` 末尾，也不在绝对输入目录下创建 `Slicers`。
+
+路径推导公式：
+
+```text
+configured_root = Y:/0717/关键帧
+fixed_prefix    = configured_root.parent.parent       # Y:/
+input_leaf      = configured_root.name                # 关键帧
+date_dir        = fixed_prefix / sub_dir              # Y:/0717
+batch_dir       = date_dir / input_leaf               # Y:/0717/关键帧
+output_root     = date_dir / 风暴时刻输出              # Y:/0717/风暴时刻输出
+input_dir       = batch_dir / dataset_name
+output_dir      = output_root / dataset_name
+video           = output_dir / slicer.mp4
+```
+
+对应关系必须严格为：
+
+```text
+--sub_dir 0717
+  输入：Y:/0717/关键帧/<QP目录名>
+  输出：Y:/0717/风暴时刻输出/<QP目录名>/slicer.mp4
+
+--sub_dir 0718
+  输入：Y:/0718/关键帧/<QP目录名>
+  输出：Y:/0718/风暴时刻输出/<QP目录名>/slicer.mp4
+```
+
+例如配置仍为 `Y:/0717/关键帧`，但执行：
+
+```powershell
+python batch_run.py --sub_dir 0718
+```
+
+则只改变日期部分：
+
+```text
+数据发现目录：Y:/0718/关键帧
+输出根目录：  Y:/0718/风暴时刻输出
+```
+
+### 2.3 绝对路径模式的数据集过滤
+
+若 `Y:/0717/关键帧` 中存在：
+
+```text
+130-2026-07-17-144135/
+QPA-2026-07-17-144135/
+QPB-2026-07-17-150000/
+QP-2026-07-17-160000/
+```
+
+只识别名称以大写 `QP` 开头的一级子目录，即使用与 Python `name.startswith("QP")` 等价的规则。上例会选择后三个目录，并忽略 `130-...`。
+
+过滤条件应同时满足：
+
+- 是 `batch_dir` 的一级子目录；
+- 目录名以大写 `QP` 开头；
+- 不是隐藏目录。
+
+绝对路径模式下，即使通过 `--datasets` 显式指定名称，也应应用同一个 `QP` 前缀约束，避免绕过共享盘数据目录契约。不存在、不是目录或不以 `QP` 开头的显式名称应产生清晰错误，而不是静默执行。
+
+相对路径模式不新增 `QP` 前缀限制，保留当前兼容行为。
+
+## 3. 输出命名与完成判定
+
+数据集原始目录名必须完整保留，不做缩写或重命名：
+
+```text
+输入：Y:/0717/关键帧/QPA-2026-07-17-144135
+输出：Y:/0717/风暴时刻输出/QPA-2026-07-17-144135/slicer.mp4
+```
+
+最终视频名继续固定为：
+
+```text
+slicer.mp4
+```
+
+一个数据集仅在下列文件存在且大小大于 `0` 时视为已完成：
+
+```text
+<该模式推导出的 output_dir>/slicer.mp4
+```
+
+因此绝对路径模式检查：
+
+```text
+Y:/0717/风暴时刻输出/<dataset_name>/slicer.mp4
+```
+
+相对路径模式仍检查：
+
+```text
+<repo>/data/0717/Slicers/<dataset_name>/slicer.mp4
+```
+
+`--force` 继续只控制是否忽略该完成判定，不改变候选目录范围和输出路径。
+
+## 4. 实现设计
+
+### 4.1 保留 `data_root` 的原始路径类型
+
+当前 `load_batch_config()` 会立即调用 `resolve_root_path()`，导致 `"data"` 也被转换成绝对路径。若后续只检查 `Path(args.data_root).is_absolute()`，两种模式都会被误判为绝对路径模式。
+
+计划调整为在解析原始配置值或原始命令行值时确定模式，并显式保留该信息，例如：
 
 ```python
-source_path = Path(args.source_dir).expanduser()
-if args.output_dir is None:
-    args.output_dir = str(Path.cwd() / "results" / source_path.name)
+data_root_raw = Path(raw_value).expanduser()
+data_root_mode = "absolute" if data_root_raw.is_absolute() else "relative"
+data_root = resolve_root_path(data_root_raw)
 ```
 
-所以当前：
+要求：
 
-```text
--s ./data/0630/QPA-2026-06-30-161131
-=> ./results/QPA-2026-06-30-161131
-```
+- 模式判断必须发生在相对路径被仓库根目录补全之前；
+- `--data_root` 显式值优先于 JSON 配置值，其原始值同时决定模式；
+- 不通过字符串是否包含盘符手工判断，统一使用 `pathlib` 的 Windows 路径语义；
+- 解析完成后可继续使用规范化绝对 `Path` 做实际 I/O，但必须另外保存模式。
 
-它不会保留 `0630`，也不会检查该批次下哪些数据已经处理过。
+由于程序运行在 Windows，共享盘示例 `Y:/0717/关键帧` 和 `Y:\\0717\\关键帧` 均应识别为绝对路径。JSON 推荐使用正斜杠，避免反斜杠转义问题。
 
-## 目标行为
+### 4.2 集中生成批次路径上下文
 
-批次入口：
-
-```powershell
-python batch_run.py --sub_dir 0630
-```
-
-统一路径规则：
-
-```text
-batch_dir  = data_root / sub_dir
-input_dir  = data_root / sub_dir / dataset_name
-output_dir = data_root / sub_dir / Slicers / dataset_name
-video      = data_root / sub_dir / Slicers / dataset_name / slicer.mp4
-```
-
-项目内示例：
-
-```text
-data_root  = <repo>/data
-sub_dir    = 0630
-input_dir  = <repo>/data/0630/QPA-2026-06-30-161131
-output_dir = <repo>/data/0630/Slicers/QPA-2026-06-30-161131
-video      = <repo>/data/0630/Slicers/QPA-2026-06-30-161131/slicer.mp4
-```
-
-共享盘示例：
-
-```text
-data_root  = X:/关键帧
-sub_dir    = 0630
-input_dir  = X:/关键帧/0630/QPA-2026-06-30-161131
-output_dir = X:/关键帧/0630/Slicers/QPA-2026-06-30-161131
-video      = X:/关键帧/0630/Slicers/QPA-2026-06-30-161131/slicer.mp4
-```
-
-不再需要 `output_near_input` 参数，也不再需要 `results_root` 分支。
-
-## 数据集命名
-
-不需要把 `--dataset_name` 作为日常参数。
-
-- 数据集名默认来自实际输入目录名，例如 `QPA-2026-06-30-161131`。
-- 输出目录默认直接使用这个原始名。
-- 不做 `QPA-2026-06-30-161131 -> QPA-161131` 这种短名压缩。
-- 如未来确实需要自定义单次输出名，可保留 `--result_name` 作为低优先级扩展，但本次计划不依赖它。
-
-## 推荐参数
-
-保留：
-
-- `-s` / `--input_dir`
-  - 单个数据集输入目录，优先级最高。
-  - 主要用于临时处理单个目录。
-- `--output_dir`
-  - 单个输出目录，优先级最高。
-  - 主要用于临时覆盖，日常批次模式不需要。
-
-新增或调整：
-
-- `--sub_dir`
-  - 批次目录，例如 `0630`。
-  - 日常入口只需要这个参数。
-- `--data_root`
-  - 可选命令行覆盖；默认从 batch JSON 读取。
-  - 如果命令行未传，就使用 `configs/spacetime_slicer_batch.json` 中的 `data_root`。
-- `--datasets`
-  - 可选，`nargs="*"`，指定一个或多个数据集目录名。
-  - 多个名称用空格分隔；PowerShell 中也可以用反引号换行。
-  - 示例：`--datasets QPA-2026-06-30-161131`。
-  - 示例：`--datasets QPA-2026-06-30-161131 QPB-2026-06-30-172000`。
-- `--force`
-  - 跳过“结果已存在”检查，强制重跑。
-- `--dry-run`
-  - 只打印将处理、跳过、重跑的数据集，不实际执行。
-
-不需要新增：
-
-- `--output_near_input`
-- `--results_root`
-- 日常用的 `--dataset_name`
-
-## 配置文件建议
-
-`configs/spacetime_slicer_batch.json` 扩展为：
-
-```json
-{
-  "reorganize_config": "reorganize_frame_images.json",
-  "slicer_config": "spacetime_slicer.json",
-  "data_root": "data",
-  "output_dir": null
-}
-```
-
-项目内数据时：
-
-```json
-{
-  "data_root": "data"
-}
-```
-
-共享盘数据时，用户只手动改 `data_root`：
-
-```json
-{
-  "data_root": "X:/关键帧"
-}
-```
-
-相对路径 `data` 按仓库根目录解析为 `<repo>/data`；绝对路径或盘符路径 `X:/关键帧` 原样使用。
-
-`configs/spacetime_slicer.json` 可以继续保留单数据集默认值，但批次模式优先使用 `--sub_dir + data_root` 发现数据，不要求每次修改其中的 `input_dir`。
-
-## 数据集发现
-
-在：
-
-```text
-batch_dir = data_root / sub_dir
-```
-
-下列出一级子目录，忽略输出/辅助目录：
-
-- `Slicers`
-- `results`
-- `__pycache__`
-- 以 `.` 开头的隐藏目录
-
-发现结果按“数据集时间”排序：
-
-- 优先解析 `QPA-YYYY-MM-DD-HHMMSS` 里的时间。
-- 解析失败时按目录名排序。
-
-## 输出已存在判定
-
-一个数据集视为已完成，当且仅当：
-
-```text
-data_root / sub_dir / Slicers / dataset_name / slicer.mp4 存在，且文件大小 > 0
-```
-
-后续可选增加 `run_status.json`，但第一版用 `slicer.mp4` 足够直接。
-
-## force 与数据集选择逻辑
-
-参考 `LiteGSWin/batch_run.py` 的核心策略：发现所有候选目录，再根据输出是否存在和 `--force` 决定处理或跳过。
-
-### 当前问题分析
-
-当前实现虽然能发现 `data_root/sub_dir` 下的全部数据集，也能过滤已有有效 `slicer.mp4` 的目录，但最终使用：
+避免在发现、跳过和执行阶段分别拼路径。新增一个集中解析函数，返回本次批次的输入根和输出根，例如：
 
 ```python
-candidates = [unprocessed[-1]] if unprocessed else []
+@dataclass(frozen=True)
+class BatchPaths:
+    input_root: Path
+    output_root: Path
+    absolute_mode: bool
+
+
+def resolve_batch_paths(data_root: Path, sub_dir: str, absolute_mode: bool) -> BatchPaths:
+    if not absolute_mode:
+        batch_dir = data_root / sub_dir
+        return BatchPaths(batch_dir, batch_dir / "Slicers", False)
+
+    fixed_prefix = data_root.parent.parent
+    date_dir = fixed_prefix / sub_dir
+    return BatchPaths(
+        date_dir / data_root.name,
+        date_dir / "风暴时刻输出",
+        True,
+    )
 ```
 
-这会把全部未处理数据压缩为排序后的最后一个，因此 `0629` 下同时存在 `152057` 和 `180200` 两组新数据时，只会执行 `180200`。这与“默认一次处理该子目录下所有未处理数据”的新需求不一致。
+实际实现可以不用 `dataclass`，但必须形成单一事实来源，确保候选发现、输出已存在检查、日志打印和真正执行使用完全相同的路径。
 
-计划调整为：
+### 4.3 调整辅助函数职责
 
-- 默认命令选中 `sub_dir` 下全部未处理数据，而不是只选最新一组。
-- 保留确定性的目录排序，按排序结果依次执行，但排序不再用于限制候选数量。
-- 排序使用正则 `.*?(\d{4})-(\d{2})-(\d{2})-(\d{6})$` 提取目录名末尾的 `YYYY-MM-DD-HHMMSS`，将拼接后的时间字符串按升序排列。例如 `QP-2026-06-29-152057` 先于 `QP-2026-06-29-180200`。
-- 当前排序不校验日期和时间是否合法；时间字符串相同时，再按完整目录名字典序排列。
-- 不能匹配上述时间格式的目录排在可匹配目录之后，并按完整目录名字典序排列。
-- 已存在且大小大于 0 的 `slicer.mp4` 仍视为已完成并跳过。
-- `--datasets` 用于将候选范围缩小到指定的一组或多组数据。
-- `--force` 只控制是否忽略已有结果，不改变 `--datasets` 指定的候选范围。
-
-### 1. 只传 `--sub_dir`
-
-```powershell
-python batch_run.py --sub_dir 0630
-```
-
-行为：
-
-- 读取 JSON 中的 `data_root`。
-- 发现 `data_root/0630` 下所有数据集。
-- 过滤掉已经存在 `data_root/0630/Slicers/<dataset_name>/slicer.mp4` 的数据集。
-- 按确定性顺序依次执行全部未完成数据集；有几组未处理，就处理几组。
-- 如果没有未完成数据，打印 `All datasets already processed.` 并退出 0。
-
-这个模式用于持续进入新数据时的日常处理，也能补齐同一目录中先前积压的未处理数据。
-
-### 2. 传 `--sub_dir --datasets <name...>`
-
-```powershell
-python batch_run.py --sub_dir 0630 --datasets QPA-2026-06-30-161131
-```
-
-行为：
-
-- 只检查指定的一个或多个数据集。
-- 如果某个数据集已经有 `slicer.mp4`，且未传 `--force`，则跳过该数据集。
-- 如果没有完成结果，则执行该数据集。
-- 因此，发生意外后只想处理 `0630` 下某个尚未完成的数据目录时，使用本命令即可。
-
-例如只处理 `QPA-2026-06-30-161131`：
-
-```powershell
-python batch_run.py --sub_dir 0630 --datasets QPA-2026-06-30-161131
-```
-
-多个数据集示例：
-
-```powershell
-python batch_run.py --sub_dir 0630 --datasets `
-  QPA-2026-06-30-161131 `
-  QPB-2026-06-30-172000
-```
-
-### 3. 传 `--sub_dir --force`
-
-```powershell
-python batch_run.py --sub_dir 0630 --force
-```
-
-行为：
-
-- 发现 `data_root/0630` 下所有数据集。
-- 不检查 `slicer.mp4` 是否存在。
-- 重跑该批次下所有数据集。
-
-### 4. 传 `--sub_dir --force --datasets <name...>`
-
-```powershell
-python batch_run.py --sub_dir 0630 --force --datasets QPA-2026-06-30-161131
-```
-
-行为：
-
-- 只重跑指定的一个或多个数据集。
-- 这是重跑一组或多组旧数据的推荐方式。
-- 如果指定数据集已有有效 `slicer.mp4`，必须加 `--force` 才会重新执行。
-
-多个旧数据集示例：
-
-```powershell
-python batch_run.py --sub_dir 0630 --force --datasets `
-  QPA-2026-06-30-161131 `
-  QPB-2026-06-30-172000 `
-  QPC-2026-06-30-181500
-```
-
-### 5. 显式 `-s / --input_dir`
-
-```powershell
-python batch_run.py -s X:/关键帧/0630/QPA-2026-06-30-161131
-```
-
-行为：
-
-- 单数据集模式。
-- `sub_dir` 默认从 `input_dir.parent.name` 推导为 `0630`。
-- `data_root` 默认从 `input_dir.parent.parent` 推导为 `X:/关键帧`，除非显式传入或 JSON 中已有更高优先级配置。
-- 如果未传 `--output_dir`，输出到 `input_dir.parent / "Slicers" / input_dir.name`。
-- 未传 `--force` 且已有 `slicer.mp4` 时跳过。
-
-## 执行流程
-
-建议拆成这些函数：
+计划将当前只依赖输入父目录的函数：
 
 ```python
-def resolve_data_root(args, batch_config) -> Path:
-    ...
+dataset_output_dir(input_dir)
+```
 
-def discover_datasets(data_root: Path, sub_dir: str) -> list[Path]:
-    ...
+改为显式接收输出根：
 
-def dataset_output_dir(input_dir: Path) -> Path:
-    return input_dir.parent / "Slicers" / input_dir.name
+```python
+def dataset_output_dir(output_root: Path, input_dir: Path) -> Path:
+    return output_root / input_dir.name
+```
 
-def output_already_exists(output_dir: Path) -> bool:
-    video_path = output_dir / "slicer.mp4"
-    return video_path.is_file() and video_path.stat().st_size > 0
+数据发现函数改为接收已经解析好的 `input_root`，并按模式应用过滤：
 
-def select_datasets(args, discovered: list[Path]) -> list[Path]:
+```python
+def discover_datasets(input_root: Path, qp_only: bool) -> list[Path]:
     ...
 ```
 
-选择逻辑伪代码：
+数据集时间排序继续使用当前目录名末尾的 `YYYY-MM-DD-HHMMSS` 规则；本次不改变排序行为。
 
-```python
-if args.input_dir:
-    candidates = [Path(args.input_dir)]
-elif args.datasets:
-    candidates = [data_root / args.sub_dir / name for name in args.datasets]
-else:
-    discovered = discover_datasets(data_root, args.sub_dir)
-    if args.force:
-        candidates = discovered
-    else:
-        candidates = [
-            p for p in discovered
-            if not output_already_exists(dataset_output_dir(p))
-        ]
+### 4.4 候选选择和运行阶段
 
-if args.datasets and not args.force:
-    candidates = [
-        p for p in candidates
-        if not output_already_exists(dataset_output_dir(p))
-    ]
-```
+批次模式的流程调整为：
 
-每个候选数据集执行时：
+1. 从命令行或 JSON 取得原始 `data_root`，在补全路径前确定相对/绝对模式。
+2. 使用 `data_root + --sub_dir + 模式` 一次性解析 `input_root` 与 `output_root`。
+3. 未传 `--datasets` 时，从 `input_root` 发现候选；绝对模式仅保留 `QP*`。
+4. 传了 `--datasets` 时，在 `input_root` 下构造指定候选，并在绝对模式校验 `QP*`、存在性和目录类型。
+5. 对每个候选使用 `output_root / dataset_name` 检查 `slicer.mp4`。
+6. 未传 `--force` 时跳过已有非空结果；传入时保留候选。
+7. 执行时将同一个已解析输出目录传给切片程序，确保不会在 `run_pipeline()` 中重新用 `input_dir.parent / Slicers` 覆盖它。
 
-```text
-source_dir = input_dir
-output_dir = input_dir.parent / "Slicers" / input_dir.name
-```
+需要特别修正当前 `run_pipeline()` 的回退逻辑：批次包含多个数据集时，不能再无条件调用旧的 `dataset_output_dir(source_path)`；应为每个候选预先绑定或现场使用统一的 `output_root` 计算输出目录。
 
-除非显式传了 `--output_dir`，否则不走其他输出分支。
+## 5. 参数行为
 
-## 简化最终视频输出目录
-
-实际繁琐目录生成在 `models/spacetime_slicer.py` 的 `SpacetimeSlicer.generate()`：
-
-```python
-stretch_suffix = ...
-run_name = f"freeze_{start_cam}_to_{end_cam}_seq..."
-output_dir = os.path.join(self.output_root, run_name)
-video_path = os.path.join(output_dir, "slicer.mp4")
-```
-
-按需求改为：
-
-```python
-# stretch_suffix = ...
-# run_name = f"freeze_{start_cam}_to_{end_cam}_seq..."
-# output_dir = os.path.join(self.output_root, run_name)
-output_dir = self.output_root
-video_path = os.path.join(output_dir, "slicer.mp4")
-```
-
-日志中打印最终 `video_path`。
-
-## 示例
-
-项目内日常处理全部未完成数据，JSON 中 `data_root = "data"`：
+### 只传 `--sub_dir`
 
 ```powershell
-python batch_run.py --sub_dir 0630
+python batch_run.py --sub_dir 0717
 ```
 
-如果发现：
+- 相对模式：发现 `<repo>/data/0717` 下所有符合现有规则且尚未完成的数据集。
+- 绝对模式：发现 `Y:/0717/关键帧` 下所有 `QP*` 且尚未完成的数据集。
+- 按现有确定性时间顺序依次处理全部未完成数据集。
 
-```text
-<repo>/data/0630/QPA-2026-06-30-161131
-<repo>/data/0630/QPB-2026-06-30-172000
-```
-
-如果两组数据都没有有效输出，则本次按顺序处理 `QPA` 和 `QPB`。如果 `QPA` 已有：
-
-```text
-<repo>/data/0630/Slicers/QPA-2026-06-30-161131/slicer.mp4
-```
-
-则跳过 `QPA`，只处理：
-
-```text
-<repo>/data/0630/QPB-2026-06-30-172000
-```
-
-输出：
-
-```text
-<repo>/data/0630/Slicers/QPB-2026-06-30-172000/slicer.mp4
-```
-
-共享盘日常处理全部未完成数据，JSON 中 `data_root = "X:/关键帧"`：
+### 配合 `--datasets`
 
 ```powershell
-python batch_run.py --sub_dir 0630
+python batch_run.py --sub_dir 0717 --datasets QPA-2026-07-17-144135
 ```
 
-输出：
+- 只处理指定数据集；未传 `--force` 时仍跳过已有非空结果。
+- 绝对模式下指定名称必须以 `QP` 开头，并且必须是输入根下真实存在的一级目录。
+
+### 配合 `--force`
+
+```powershell
+python batch_run.py --sub_dir 0717 --force
+```
+
+- 重跑本模式下发现的全部候选。
+- 绝对模式仍不会处理非 `QP*` 目录。
+- 日志应打印将重跑的数据集及其实际输出目录。
+
+### 显式单数据集模式
+
+```powershell
+python batch_run.py -s <input_dir> --output_dir <output_dir>
+```
+
+显式路径继续优先，本次不根据绝对 `data_root` 自动改写用户显式给出的 `input_dir` 或 `output_dir`。
+
+## 6. 错误处理与日志
+
+以下情况应在切片开始前给出包含最终解析路径的明确错误：
+
+- 绝对 `data_root` 缺少可替换的日期父级或末级输入目录名；
+- 解析后的 `input_root` 不存在或不是目录；
+- `--datasets` 指定项不存在、不是一级目录，或在绝对模式下不以 `QP` 开头；
+- `--sub_dir` 为空、包含路径分隔符、为 `.`/`..` 或是绝对路径。`sub_dir` 必须只是单个日期目录名，防止它改变固定路径结构。
+
+运行前日志至少打印：
 
 ```text
-X:/关键帧/0630/Slicers/<dataset_name>/slicer.mp4
+Data-root mode: relative|absolute
+Input root: ...
+Output root: ...
+Will process N dataset(s).
 ```
 
-只处理一个尚未完成的指定数据集：
+每个数据集继续打印完整输入目录和完整输出目录，方便确认中文共享盘路径是否正确。
 
-```powershell
-python batch_run.py --sub_dir 0630 --datasets QPA-2026-06-30-161131
-```
+## 7. 测试计划
 
-重跑整个批次：
+在 `test/test_batch_run.py` 中保留现有测试，并增加以下覆盖。
 
-```powershell
-python batch_run.py --sub_dir 0630 --force
-```
+### 相对路径回归
 
-只重跑一个旧数据集：
+- 原始 `data_root = "data"` 时仍判定为相对模式，即使内部规范化后是绝对路径。
+- `--sub_dir 0717` 仍从 `<repo>/data/0717` 读取。
+- 输出仍为 `<repo>/data/0717/Slicers/<dataset>/slicer.mp4`。
+- 不新增 `QP` 限制，现有普通目录发现行为保持不变。
+- 已有非空 `slicer.mp4`、空文件、`--force`、多数据集排序和 `--datasets` 行为均不回归。
 
-```powershell
-python batch_run.py --sub_dir 0630 --force --datasets QPA-2026-06-30-161131
-```
+### 绝对路径路径推导
 
-只重跑多个旧数据集：
+- 配置 `Y:/0717/关键帧` 且 `--sub_dir 0717` 时，输入根为 `Y:/0717/关键帧`，输出根为 `Y:/0717/风暴时刻输出`。
+- 同一配置配合 `--sub_dir 0718` 时，仅日期段变成 `0718`，其余段保持不变。
+- 绝对模式不生成 `Y:/0717/关键帧/0717`，也不生成 `Y:/0717/关键帧/Slicers`。
+- `--data_root` 命令行覆盖配置时，由命令行原始值决定模式和路径。
 
-```powershell
-python batch_run.py --sub_dir 0630 --force --datasets `
-  QPA-2026-06-30-161131 `
-  QPB-2026-06-30-172000
-```
+### 绝对路径过滤与完成判定
 
-## 测试计划
+- 同时存在 `130-*`、`QPA-*`、`QP-*` 时，只发现后两者。
+- 小写 `qp-*` 不匹配大写 `QP` 规则。
+- `--datasets 130-*` 明确报错。
+- 输出 `Y:/0717/风暴时刻输出/QPA-.../slicer.mp4` 非空时跳过对应输入。
+- 输出文件为空时仍选择处理。
+- `--force` 可重跑已有结果，但仍排除非 `QP*` 目录。
+- 多个候选实际传入切片程序的输出目录分别位于同一个 `风暴时刻输出` 下，且保留各自完整目录名。
 
-- `data_root = data` 且 `--sub_dir 0630`：
-  - 发现 `<repo>/data/0630` 下数据集。
-  - 跳过已有 `<repo>/data/0630/Slicers/<dataset_name>/slicer.mp4` 的目录。
-  - 选择并按顺序处理全部未完成数据集。
-  - 覆盖同一 `sub_dir` 下同时存在两组或更多未完成数据的场景。
-- `data_root = X:/关键帧` 且 `--sub_dir 0630`：
-  - 使用同一套逻辑构建 `X:/关键帧/0630/Slicers/<dataset_name>/slicer.mp4`。
-- `--sub_dir 0630 --force`：
-  - 选择该批次下所有数据集。
-- `--sub_dir 0630 --datasets QPA-2026-06-30-161131`：
-  - 只选择指定数据集。
-  - 该数据集未完成时正常执行。
-  - 如果输出已存在且未传 `--force`，跳过。
-- `--sub_dir 0630 --force --datasets QPA-2026-06-30-161131`：
-  - 只选择指定数据集并重跑。
-- `--sub_dir 0630 --force --datasets QPA-2026-06-30-161131 QPB-2026-06-30-172000`：
-  - 只选择这两个指定数据集并重跑。
-- `-s X:/关键帧/0630/QPA-2026-06-30-161131`：
-  - 默认输出为 `X:/关键帧/0630/Slicers/QPA-2026-06-30-161131/slicer.mp4`。
-- `models/spacetime_slicer.py`：
-  - 不再创建 `freeze_...` 子目录。
-  - 视频直接写入 `<output_dir>/slicer.mp4`。
+### 参数安全性
 
-运行：
+- 拒绝 `--sub_dir ../0717`、`Y:/0717`、空字符串和包含 `/` 或 `\\` 的值。
+- 中文路径与正斜杠/正确转义的反斜杠写法都能得到相同路径。
+- 显式 `-s`、显式 `--output_dir` 的既有测试继续通过。
+
+测试命令：
 
 ```powershell
 python -m unittest discover -s test -p test_batch_run.py
 ```
 
-## 风险与注意事项
+## 8. 验收标准
 
-- 共享盘路径可能包含中文，JSON 中建议写 `X:/关键帧`，避免反斜杠转义问题。
-- `--sub_dir` 默认会处理全部未完成数据；如果目录中存在大量积压任务，本次运行时间会相应增加。
-- 不再需要额外增加 `--all_new`，默认行为本身就是处理全部未完成数据。
-- 仅处理某个未完成数据集使用 `--datasets <name>`；重新处理已有结果的数据集使用 `--force --datasets <name>`。
-- `--force` 可能覆盖旧结果，执行前日志必须打印将重跑的数据集列表。
-- 多次运行同一个输出目录会覆盖或复用 `slicer.mp4`，这是简化输出目录后的预期行为。
+使用：
+
+```json
+{
+  "data_root": "Y:/0717/关键帧"
+}
+```
+
+并执行：
+
+```powershell
+python batch_run.py --sub_dir 0717
+```
+
+最终必须满足：
+
+- 只读取 `Y:/0717/关键帧` 中名称以 `QP` 开头的一级数据目录；
+- 不读取 `130-2026-07-17-144135` 等非 `QP` 目录；
+- 每个结果保存为 `Y:/0717/风暴时刻输出/<原始QP目录名>/slicer.mp4`；
+- 数据集目录名和 `slicer.mp4` 文件名与当前保持一致；
+- 将命令改成 `--sub_dir 0718` 时，仅路径中的 `0717` 日期目录变为 `0718`；
+- `--sub_dir 0718` 时输入必须来自 `Y:/0718/关键帧/<QP目录名>`，输出必须写入 `Y:/0718/风暴时刻输出/<QP目录名>/slicer.mp4`，输入和输出日期始终一致；
+- 将 `data_root` 恢复为 `"data"` 后，所有原有项目内读取和输出路径保持不变。

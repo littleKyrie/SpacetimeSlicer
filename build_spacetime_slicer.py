@@ -9,6 +9,7 @@ import numpy as np
 
 from models.rife_ncnn import RifeNcnnInterpolator
 from models.spacetime_slicer import SpacetimeSlicer
+from utils.opencv_io import imread_required
 
 
 DEFAULT_CONFIG_PATH = Path(__file__).resolve().parent / 'configs' / 'spacetime_slicer.json'
@@ -149,7 +150,10 @@ def create_strategy(method, slicer, camera_ids):
         print('>> Building the temporal median background for Hybrid segmentation...')
         start_cam = camera_ids[0]
         gray_frames = [
-            cv2.cvtColor(cv2.imread(slicer.frame_paths_dict[start_cam][i]), cv2.COLOR_BGR2GRAY)
+            cv2.cvtColor(
+                imread_required(slicer.frame_paths_dict[start_cam][i]),
+                cv2.COLOR_BGR2GRAY,
+            )
             for i in range(0, slicer.total_frames, 5)
         ]
         median_bg = np.median(gray_frames, axis=0).astype(np.uint8)
@@ -328,6 +332,12 @@ def build_parser():
         default=False,
         help='Enable UHD mode; use --no-rife_uhd to override a true config value.',
     )
+    parser.add_argument(
+        '--ffmpeg_exe',
+        help='Path to FFmpeg; defaults to FFMPEG_EXE or ffmpeg on PATH.',
+    )
+    parser.add_argument('--h264_crf', type=int, default=18, help='libx264 CRF (0-51).')
+    parser.add_argument('--h264_preset', default='medium', help='libx264 encoding preset.')
     parser.add_argument('--method', default='RVM',
                         help='RVM, Hybrid, SAM2_BBox, RMBG2, or rembg-<model>')
     return parser
@@ -407,6 +417,9 @@ def main(argv=None):
             effect_base_mode=args.effect_base_mode,
             live_subject_opacity=args.live_subject_opacity,
             live_subject_alpha_threshold=args.live_subject_alpha_threshold,
+            ffmpeg_executable=args.ffmpeg_exe,
+            h264_crf=args.h264_crf,
+            h264_preset=args.h264_preset,
         )
     finally:
         if rife_interpolator is not None:

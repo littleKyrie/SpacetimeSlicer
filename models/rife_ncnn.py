@@ -6,6 +6,8 @@ from pathlib import Path
 
 import cv2
 
+from utils.opencv_io import imread_unicode
+
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
@@ -94,7 +96,7 @@ class RifeNcnnInterpolator:
                 f'{result.stderr.strip()}'
             )
 
-        interpolated = cv2.imread(output_path)
+        interpolated = imread_unicode(output_path)
         if interpolated is None:
             raise RuntimeError(f'RIFE did not create an output frame: {output_path}')
         return interpolated

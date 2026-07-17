@@ -4,6 +4,8 @@ import re
 import numpy as np
 import torch
 from models.rife_ncnn import NeuralSlowMotionWriter
+from utils.ffmpeg_video import FfmpegH264Writer, resolve_ffmpeg_executable
+from utils.opencv_io import imread_required
 
 
 FRAME_DIR_PATTERN = re.compile(r'^\d+$')
@@ -84,8 +86,8 @@ class SpacetimeSlicer:
         if frame_paths_by_frame is not None and camera_id in frame_paths_by_frame:
             if idx not in frame_paths_by_frame[camera_id]:
                 raise ValueError(f"Camera {camera_id} does not contain frame {idx}")
-            return cv2.imread(frame_paths_by_frame[camera_id][idx])
-        return cv2.imread(self.frame_paths_dict[camera_id][idx])
+            return imread_required(frame_paths_by_frame[camera_id][idx])
+        return imread_required(self.frame_paths_dict[camera_id][idx])
 
     def write_frame_repeat(self, out, frame, stretch=1):
         """写入帧，stretch 控制重复次数（默认 1 = 不重复）"""
@@ -522,7 +524,10 @@ class SpacetimeSlicer:
                  initial_patch_dilate=1,
                  effect_base_mode='patched_canvas',
                  live_subject_opacity=1.0,
-                 live_subject_alpha_threshold=16):
+                 live_subject_alpha_threshold=16,
+                 ffmpeg_executable=None,
+                 h264_crf=18,
+                 h264_preset='medium'):
         """
         生成时空切片视频（残影渐变 → 回收 → 多视角凝结 → 继续播放）
 
@@ -571,6 +576,9 @@ class SpacetimeSlicer:
             raise ValueError("stretch values must be at least 1")
         if freeze_interp_mode not in ('rife', 'repeat', 'blend'):
             raise ValueError(f"Unknown freeze interpolation mode: {freeze_interp_mode}")
+        if not 0 <= h264_crf <= 51:
+            raise ValueError("h264_crf must be between 0 and 51")
+        resolved_ffmpeg = resolve_ffmpeg_executable(ffmpeg_executable)
         start_cam = camera_ids[0]
         end_cam = camera_ids[-1]
         tail_cam = self.resolve_tail_camera_id(
@@ -603,15 +611,28 @@ class SpacetimeSlicer:
 
         video_path = os.path.join(output_dir, "slicer.mp4")
         print(f"Output video: {video_path}")
+        print(
+            f"H.264 encoding: libx264, CRF {h264_crf}, preset {h264_preset} "
+            f"(FFmpeg: {resolved_ffmpeg})"
+        )
 
         sample_frame = self.read_frame(0, start_cam)
         h, w = sample_frame.shape[:2]
-        out = cv2.VideoWriter(video_path, cv2.VideoWriter_fourcc(*'mp4v'), self.fps, (w, h))
+        out = FfmpegH264Writer(
+            video_path,
+            fps=self.fps,
+            frame_size=(w, h),
+            executable=resolved_ffmpeg,
+            crf=h264_crf,
+            preset=h264_preset,
+        )
         if not out.isOpened():
-            out.release()
+            try:
+                out.release()
+            except RuntimeError as exc:
+                raise RuntimeError(f"Failed to start FFmpeg video writer: {exc}") from exc
             raise RuntimeError(
-                f"Failed to open video writer: {video_path} "
-                f"(path length: {len(os.path.abspath(video_path))})"
+                f"Failed to start FFmpeg video writer for: {video_path}"
             )
 
         all_ghosts = []
@@ -703,8 +724,8 @@ class SpacetimeSlicer:
         # ============ 6. 收尾 ============
         out.release()
         if not os.path.isfile(video_path) or os.path.getsize(video_path) == 0:
-            raise RuntimeError(f"Video writer did not create a valid output file: {video_path}")
-        print(f"\n视频已输出！保存在: {video_path}")
+            raise RuntimeError(f"FFmpeg did not create a valid output file: {video_path}")
+        print(f"视频已输出（H.264）！保存在: {video_path}")
         print(f"   残影: ghost_interval={ghost_interval}, 共 {ghost_count} 个, "
               f"透明度 {ghost_opacity_start:.0%}->{ghost_opacity_end:.0%}")
         print(f"   片尾淡出: {total_fade_frames} 帧 ×{stretch_fade}")

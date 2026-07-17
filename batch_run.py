@@ -2,6 +2,7 @@ import argparse
 import json
 import re
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 
 from build_spacetime_slicer import (
@@ -30,6 +31,13 @@ REORGANIZE_OVERRIDE_OPTIONS = {
     'image_ext': '--image-ext',
     'dry_run': '--dry-run',
 }
+
+
+@dataclass(frozen=True)
+class BatchPaths:
+    input_root: Path
+    output_root: Path
+    absolute_mode: bool
 
 
 def resolve_root_path(value):
@@ -71,7 +79,9 @@ def load_batch_config(parser, path):
         if value is not None:
             config[key] = str(resolve_config_path(value, config_path))
     if config.get('data_root') is not None:
-        config['data_root'] = str(resolve_root_path(config['data_root']))
+        raw_data_root = Path(config['data_root']).expanduser()
+        config['data_root_is_absolute'] = raw_data_root.is_absolute()
+        config['data_root'] = str(resolve_root_path(raw_data_root))
     return config
 
 
@@ -117,16 +127,22 @@ def build_parser(config_defaults=None):
     )
     parser.add_argument(
         '--sub_dir',
-        help='Batch directory under data_root, such as 0630.',
+        help=(
+            'Batch date directory, such as 0717. With an absolute data_root, '
+            'this replaces data_root parent date directory.'
+        ),
     )
     parser.add_argument(
         '--data_root',
-        help='Root containing batch directories; relative paths are resolved under the repo root.',
+        help=(
+            'Relative batch root under the repo, or an absolute input template '
+            'such as Y:/0717/关键帧.'
+        ),
     )
     parser.add_argument(
         '--datasets',
         nargs='*',
-        help='One or more dataset directory names under data_root/sub_dir.',
+        help='One or more dataset directory names under the resolved batch input root.',
     )
     parser.add_argument(
         '--force',
@@ -164,8 +180,8 @@ def argv_has_option(argv, *options):
     return False
 
 
-def dataset_output_dir(input_dir):
-    return input_dir.parent / 'Slicers' / input_dir.name
+def dataset_output_dir(output_root, input_dir):
+    return output_root / input_dir.name
 
 
 def output_already_exists(output_dir):
@@ -181,19 +197,64 @@ def dataset_sort_key(path):
     return (1, path.name)
 
 
-def discover_datasets(data_root, sub_dir):
-    batch_dir = data_root / sub_dir
-    if not batch_dir.exists():
-        raise FileNotFoundError(f'batch directory does not exist: {batch_dir}')
+def discover_datasets(input_root, qp_only=False):
+    if not input_root.exists():
+        raise FileNotFoundError(f'batch directory does not exist: {input_root}')
+    if not input_root.is_dir():
+        raise NotADirectoryError(f'batch path is not a directory: {input_root}')
     return sorted(
         (
-            path for path in batch_dir.iterdir()
+            path for path in input_root.iterdir()
             if path.is_dir()
             and path.name not in IGNORED_DATASET_DIRS
             and not path.name.startswith('.')
+            and (not qp_only or path.name.startswith('QP'))
         ),
         key=dataset_sort_key,
     )
+
+
+def validate_sub_dir(parser, sub_dir):
+    if (
+        not sub_dir
+        or sub_dir in {'.', '..'}
+        or '/' in sub_dir
+        or '\\' in sub_dir
+        or Path(sub_dir).is_absolute()
+        or Path(sub_dir).name != sub_dir
+    ):
+        parser.error('--sub_dir must be a single directory name without path separators')
+
+
+def resolve_batch_paths(data_root, sub_dir, absolute_mode):
+    if not absolute_mode:
+        input_root = data_root / sub_dir
+        return BatchPaths(input_root, input_root / 'Slicers', False)
+
+    date_template_dir = data_root.parent
+    if not data_root.name or not date_template_dir.name:
+        raise ValueError(
+            'absolute data_root must have the form '
+            '<fixed-prefix>/<date>/<input-directory>'
+        )
+    date_dir = date_template_dir.parent / sub_dir
+    return BatchPaths(
+        input_root=date_dir / data_root.name,
+        output_root=date_dir / '风暴时刻输出',
+        absolute_mode=True,
+    )
+
+
+def validate_explicit_dataset(parser, input_root, name, qp_only):
+    name_path = Path(name)
+    if name_path.is_absolute() or name_path.name != name or '/' in name or '\\' in name:
+        parser.error(f'dataset name must be a single directory name: {name}')
+    if qp_only and not name.startswith('QP'):
+        parser.error(f'dataset name must start with QP in absolute data_root mode: {name}')
+    candidate = input_root / name
+    if qp_only and (not candidate.exists() or not candidate.is_dir()):
+        parser.error(f'dataset directory does not exist: {candidate}')
+    return candidate
 
 
 def resolve_input_sub_dir(input_dir, explicit_sub_dir=None):
@@ -204,11 +265,15 @@ def resolve_input_sub_dir(input_dir, explicit_sub_dir=None):
 
 def resolve_dataset_candidates(parser, args):
     data_root = Path(args.data_root).expanduser() if args.data_root else DEFAULT_DATA_ROOT
+    data_root_is_absolute = getattr(args, 'data_root_is_absolute', False)
+    if args.data_root_explicit:
+        data_root_is_absolute = data_root.is_absolute()
     if not data_root.is_absolute():
         data_root = resolve_root_path(data_root)
     else:
         data_root = data_root.resolve()
     args.data_root = str(data_root)
+    args.data_root_is_absolute = data_root_is_absolute
 
     single_input_mode = bool(args.source_dir) and (
         args.source_dir_explicit or not args.sub_dir
@@ -221,40 +286,78 @@ def resolve_dataset_candidates(parser, args):
             input_dir = input_dir.resolve()
         args.sub_dir = resolve_input_sub_dir(input_dir, args.sub_dir)
         if args.output_dir is None or not args.output_dir_explicit:
-            args.output_dir = str(dataset_output_dir(input_dir))
+            args.output_dir = str(input_dir.parent / 'Slicers' / input_dir.name)
         args.datasets_to_process = [str(input_dir)]
+        args.output_dirs_to_process = [args.output_dir]
+        args.batch_input_root = None
+        args.batch_output_root = None
         return
 
     if not args.sub_dir:
         parser.error('provide --sub_dir, --input_dir, or input_dir in the slicer config')
+    validate_sub_dir(parser, args.sub_dir)
     if not args.output_dir_explicit:
         args.output_dir = None
 
+    try:
+        batch_paths = resolve_batch_paths(
+            data_root,
+            args.sub_dir,
+            data_root_is_absolute,
+        )
+    except ValueError as exc:
+        parser.error(str(exc))
+    args.batch_input_root = str(batch_paths.input_root)
+    args.batch_output_root = str(batch_paths.output_root)
+    if not batch_paths.input_root.exists():
+        parser.error(f'batch directory does not exist: {batch_paths.input_root}')
+    if not batch_paths.input_root.is_dir():
+        parser.error(f'batch path is not a directory: {batch_paths.input_root}')
+
     if args.datasets is not None:
-        candidates = [data_root / args.sub_dir / name for name in args.datasets]
+        candidates = [
+            validate_explicit_dataset(
+                parser,
+                batch_paths.input_root,
+                name,
+                batch_paths.absolute_mode,
+            )
+            for name in args.datasets
+        ]
     else:
         try:
-            discovered = discover_datasets(data_root, args.sub_dir)
-        except FileNotFoundError as exc:
+            discovered = discover_datasets(
+                batch_paths.input_root,
+                qp_only=batch_paths.absolute_mode,
+            )
+        except (FileNotFoundError, NotADirectoryError) as exc:
             parser.error(str(exc))
         if args.force:
             candidates = discovered
         else:
             candidates = [
                 path for path in discovered
-                if not output_already_exists(dataset_output_dir(path))
+                if not output_already_exists(
+                    dataset_output_dir(batch_paths.output_root, path)
+                )
             ]
 
     selected = []
+    selected_outputs = []
     skipped = []
     for candidate in candidates:
-        output_dir = dataset_output_dir(candidate)
+        if args.output_dir_explicit and len(candidates) == 1:
+            output_dir = Path(args.output_dir).expanduser()
+        else:
+            output_dir = dataset_output_dir(batch_paths.output_root, candidate)
         if not args.force and output_already_exists(output_dir):
             skipped.append(str(candidate))
             continue
         selected.append(str(candidate.resolve()))
+        selected_outputs.append(str(output_dir))
 
     args.datasets_to_process = selected
+    args.output_dirs_to_process = selected_outputs
     args.skipped_datasets = skipped
 
 
@@ -275,6 +378,7 @@ def parse_args(argv=None):
     args, slicer_args = parser.parse_known_args(argv)
     args.source_dir_explicit = argv_has_option(argv, '-s', '--input_dir')
     args.output_dir_explicit = argv_has_option(argv, '--output_dir')
+    args.data_root_explicit = argv_has_option(argv, '--data_root')
 
     if args.reorganize_config is None:
         parser.error('reorganize_config must be set in the batch config or command line')
@@ -363,6 +467,14 @@ def run_pipeline(
     structure_checker=has_reorganized_frame_structure,
 ):
     datasets = getattr(args, 'datasets_to_process', None) or []
+    batch_input_root = getattr(args, 'batch_input_root', None)
+    batch_output_root = getattr(args, 'batch_output_root', None)
+    if batch_input_root is not None:
+        mode = 'absolute' if args.data_root_is_absolute else 'relative'
+        print(f'Data-root mode: {mode}')
+        print(f'Input root: {batch_input_root}')
+        print(f'Output root: {batch_output_root}')
+
     if not datasets:
         skipped = getattr(args, 'skipped_datasets', [])
         if skipped:
@@ -371,12 +483,16 @@ def run_pipeline(
             print('All datasets already processed.')
         return 0
 
+    output_dirs = getattr(args, 'output_dirs_to_process', None) or []
     print(f'Will process {len(datasets)} dataset(s).')
-    for source_dir in datasets:
+    for index, source_dir in enumerate(datasets):
         source_path = Path(source_dir)
-        output_dir = args.output_dir
-        if output_dir is None or len(datasets) > 1:
-            output_dir = str(dataset_output_dir(source_path))
+        if index < len(output_dirs):
+            output_dir = output_dirs[index]
+        elif batch_output_root is not None:
+            output_dir = str(dataset_output_dir(Path(batch_output_root), source_path))
+        else:
+            output_dir = args.output_dir
         result = run_single_dataset(
             args,
             slicer_args,

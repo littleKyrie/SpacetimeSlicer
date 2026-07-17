@@ -34,5 +34,8 @@
   "rife_exe": null,
   "rife_model_dir": null,
   "rife_uhd": false,
+  "ffmpeg_exe": null,
+  "h264_crf": 18,
+  "h264_preset": "medium",
   "method": "RVM"
 }

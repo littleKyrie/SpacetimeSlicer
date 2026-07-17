@@ -3,6 +3,7 @@ from pathlib import Path
 
 # Model interface
 from models.seg_strategy import *
+from utils.opencv_io import imread_required
 
 
 class HybridStrategy(SegmentationStrategy):
@@ -53,6 +54,11 @@ class HybridStrategy(SegmentationStrategy):
 
     def _get_median_background(self):
         print("计算用于 Hybrid 方案的全局中值背景...")
-        frames = [cv2.cvtColor(cv2.imread(os.path.join(self.input_dir, self.image_files[i])), cv2.COLOR_BGR2GRAY) 
-                  for i in range(0, self.total_frames, 5)]
+        frames = [
+            cv2.cvtColor(
+                imread_required(os.path.join(self.input_dir, self.image_files[i])),
+                cv2.COLOR_BGR2GRAY,
+            )
+            for i in range(0, self.total_frames, 5)
+        ]
         return np.median(frames, axis=0).astype(np.uint8)

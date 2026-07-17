@@ -47,6 +47,7 @@ SpacetimeSlicer/
 
 - Git for Windows
 - [uv](https://docs.astral.sh/uv/) —— Python 包管理与虚拟环境工具
+- **FFmpeg（必需的系统依赖）** —— 程序通过 FFmpeg stdin 直接将原始帧编码为 H.264；未安装时无法生成 `slicer.mp4`
 - 使用 CUDA 后端时，安装与所选 PyTorch Wheel 兼容的 NVIDIA 驱动
 - 使用 RIFE 时，显卡驱动需要提供 Vulkan 支持
 
@@ -95,7 +96,69 @@ uv pip install torch==2.7.0 torchvision==0.22.0 torchaudio==2.7.0 --index-url ht
 uv pip install "numpy>=2.2,<2.3" "opencv-contrib-python>=4.10,<5" "pillow>=10,<13" "ultralytics>=8.3,<9" "transformers>=4.45,<6" "hydra-core>=1.3,<2" "iopath>=0.1.10,<0.2" "huggingface-hub>=0.26" "safetensors>=0.4" "kornia>=0.7,<1" "scipy>=1.14,<2" "matplotlib>=3.9,<4" "tqdm>=4.66" "pytest>=8,<10"
 ```
 
-#### 4. 获取第三方源码
+#### 4. 安装并配置 FFmpeg（必需）
+
+视频输出不再使用 OpenCV `VideoWriter`。无论选择哪种分割方法，都必须提供
+包含 `libx264` 编码器的 FFmpeg。
+
+使用 winget 安装：
+
+```powershell
+winget install --id Gyan.FFmpeg -e
+```
+
+也可以从 FFmpeg Windows 构建发行包下载并解压，例如：
+
+```text
+C:\ffmpeg-8.1.2-essentials_build\bin\ffmpeg.exe
+```
+
+手动解压时，在 Windows“系统属性 → 高级 → 环境变量”中编辑用户或系统
+`Path`，添加包含 `ffmpeg.exe` 的 `bin` 目录：
+
+```text
+C:\ffmpeg-8.1.2-essentials_build\bin
+```
+
+修改系统环境变量后，必须完全关闭所有 VS Code 窗口并重新启动 VS Code；
+已经打开的 VS Code 和集成终端不会自动获得新的 `Path`。建议从能够运行
+FFmpeg 的新系统终端进入项目并执行 `code .`。
+
+依次验证系统终端、VS Code 终端和 `uv run` 子进程都能找到 FFmpeg：
+
+```powershell
+ffmpeg -version
+Get-Command ffmpeg
+uv run python -c "import shutil; print(shutil.which('ffmpeg'))"
+```
+
+最后一条命令必须输出具体的 `ffmpeg.exe` 路径，不能是 `None`。
+
+如果不希望修改系统 `Path`，可以在 `configs/spacetime_slicer.json` 中填写
+完整可执行文件路径或 `bin` 目录：
+
+```json
+{
+  "ffmpeg_exe": "C:\\ffmpeg-8.1.2-essentials_build\\bin"
+}
+```
+
+也可以设置 `FFMPEG_EXE` 环境变量，或运行时传入：
+
+```powershell
+python batch_run.py --sub_dir 0717 `
+  --ffmpeg_exe C:\ffmpeg-8.1.2-essentials_build\bin\ffmpeg.exe
+```
+
+当系统 `Path` 已正确配置时，保持以下配置即可自动查找：
+
+```json
+{
+  "ffmpeg_exe": null
+}
+```
+
+#### 5. 获取第三方源码
 
 ```powershell
 # SAM2（固定版本 —— 仅 SAM2_BBox 方法需要）
@@ -108,7 +171,7 @@ git clone https://github.com/PeterL1n/RobustVideoMatting.git third_party/RobustV
 git -C third_party/RobustVideoMatting checkout 17d1774
 ```
 
-#### 5. 下载模型权重（按需）
+#### 6. 下载模型权重（按需）
 
 RVM 权重由 `torch.hub` 在首次运行时自动下载到 `~/.cache/torch/hub/checkpoints/rvm_resnet50.pth`，无需手动操作。
 
@@ -124,23 +187,26 @@ New-Item -ItemType Directory -Force .\checkpoints\yolo | Out-Null
 Invoke-WebRequest https://github.com/ultralytics/assets/releases/download/v8.3.0/yolov8n.pt -OutFile .\checkpoints\yolo\yolov8n.pt
 ```
 
-#### 6. 下载 RIFE（可选）
+#### 7. 下载 RIFE（可选）
 
 仅在需要帧插值（`stretch_ghost > 1` 或 `freeze_interp_mode=rife` 且 `stretch_freeze > 1`）时需要。
 
 从 [rife-ncnn-vulkan Release](https://github.com/nihui/rife-ncnn-vulkan/releases) 下载 Windows 版本，将 `rife-ncnn-vulkan.exe` 及模型目录（如 `rife-v4.6`）放入 `third_party/rife-ncnn-vulkan/`。
 
-#### 7. 验证
+#### 8. 验证
 
 ```powershell
 python -c "import cv2, numpy, PIL, torch, torchvision; print('Core imports OK'); print('Torch:', torch.__version__); print('CUDA available:', torch.cuda.is_available())"
+ffmpeg -version
+uv run python -c "import shutil; print('FFmpeg:', shutil.which('ffmpeg'))"
 python build_spacetime_slicer.py --help
 python batch_run.py --help
 ```
 
 #### 自动化脚本（可选）
 
-项目同时提供 `setup.ps1`，可一键完成上述步骤。执行前需安装 uv 和 Git：
+项目同时提供 `setup.ps1`，可完成 Python、模型和第三方源码配置。该脚本当前
+**不会安装 FFmpeg**，执行前需先安装 uv、Git 和 FFmpeg：
 
 ```powershell
 Set-ExecutionPolicy -Scope Process Bypass
@@ -519,6 +585,38 @@ python batch_run.py --sub_dir 0630 --force
 data/0630/Slicers/<数据集名>/slicer.mp4
 ```
 
+Python/OpenCV 生成的每一帧会通过 stdin 直接传给 FFmpeg，并由 `libx264`
+一次编码为 H.264，不再先生成 mp4v 视频后进行二次转码。默认参数为
+`CRF 18`、`preset medium` 和 `yuv420p`。
+运行前需安装 FFmpeg 并加入 `PATH`，也可以通过 `FFMPEG_EXE` 环境变量、
+切片配置中的 `ffmpeg_exe` 或命令行 `--ffmpeg_exe` 指定可执行文件。
+
+```powershell
+winget install --id Gyan.FFmpeg -e
+```
+
+编码过程中使用同目录临时文件，成功后再替换最终结果，不生成
+`slicer_mp4v.mp4`，最终只保留：
+
+```text
+<输出目录>/slicer.mp4
+```
+
+当 `data_root` 使用绝对路径模板，例如 `Y:/0717/关键帧` 时，`--sub_dir`
+同时决定输入和输出的日期目录，并且只读取名称以大写 `QP` 开头的一级子目录：
+
+```powershell
+python batch_run.py --sub_dir 0717
+```
+
+```text
+输入：Y:/0717/关键帧/<QP数据集名>
+输出：Y:/0717/风暴时刻输出/<QP数据集名>/slicer.mp4
+```
+
+改为 `--sub_dir 0718` 后，输入和输出会同时切换为 `Y:/0718/...`；不会在
+`关键帧` 下追加日期目录，也不会在其中创建 `Slicers`。
+
 ### 同时覆盖重组和切片参数
 
 ```powershell
@@ -546,8 +644,8 @@ python batch_run.py `
 | --- | --- |
 | `--config` | 批处理 JSON，默认 `configs/spacetime_slicer_batch.json` |
 | `-s` / `--input_dir` | 单数据集输入目录 |
-| `--data_root` | 批处理数据根目录，默认 `data/` |
-| `--sub_dir` | `data_root` 下的批次目录 |
+| `--data_root` | 相对批处理根目录，或形如 `Y:/0717/关键帧` 的绝对输入路径模板；默认 `data/` |
+| `--sub_dir` | 批次日期目录；绝对路径模式下同时替换输入和输出的日期段 |
 | `--datasets` | 只处理指定数据集名称 |
 | `--force` | 忽略已有 `slicer.mp4` 并重新处理 |
 | `--output_dir` | 单数据集输出目录 |
@@ -557,6 +655,13 @@ python batch_run.py `
 | `--camera-count` | 重组冻结机位参数，实际写入数量为该值加 1 |
 | `--image-ext` | 重组目标扩展名；文件只复制，不重新编码 |
 | `--dry-run` / `--no-dry-run` | 预览或关闭预览模式 |
+
+切片参数还支持 `--ffmpeg_exe`、`--h264_crf` 和 `--h264_preset`，它们会由
+`batch_run.py` 原样转交给切片器。例如：
+
+```powershell
+python batch_run.py --sub_dir 0717 --h264_crf 20 --h264_preset slow
+```
 
 ## 配置文件
 
@@ -591,6 +696,8 @@ python batch_run.py `
 ```
 
 相对的子配置路径以批处理配置文件所在目录为基准解析；`data_root` 相对项目根目录解析。
+绝对 `data_root` 按 `<固定前缀>/<日期>/<输入目录名>` 解释，运行时以
+`--sub_dir` 替换日期段，并将输出写入同一日期目录下的 `风暴时刻输出`。
 
 ## 测试与帮助
 
@@ -637,9 +744,12 @@ python build_spacetime_slicer.py `
   --rife_model_dir .\third_party\rife-ncnn-vulkan\rife-v4.6
 ```
 
-### OpenCV 无法创建 `slicer.mp4`
+### FFmpeg 无法创建 `slicer.mp4`
 
-检查输出目录权限、路径长度以及 OpenCV 的 MP4 编码支持。项目当前使用 `mp4v` 编码器，输出图片分辨率必须保持一致。
+项目将 OpenCV/Numpy 生成的 BGR 帧直接写入 FFmpeg，由 `libx264` 编码为
+H.264。先运行 `ffmpeg -version`，或通过 `--ffmpeg_exe` 指定
+`ffmpeg.exe` 文件或包含它的 `bin` 目录；同时检查输出目录权限、路径长度，
+并确保所有输出帧的分辨率一致。
 
 ### PowerShell 显示中文乱码
 

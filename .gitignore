@@ -9,3 +9,5 @@ __pycache__/
 .vscode/
 checkpoints/
 third_party/rife-ncnn-vulkan/
+third_party/RobustVideoMatting
+*.whl

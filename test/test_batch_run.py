@@ -1,4 +1,5 @@
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -7,12 +8,15 @@ from batch_run import REPO_ROOT, parse_args, run_pipeline
 
 
 class BatchRunTest(unittest.TestCase):
-    def make_batch_config(self, temp_dir, data_root):
+    def make_batch_config(self, temp_dir, data_root, absolute_mode=False):
         config_path = Path(temp_dir) / 'batch.json'
+        configured_data_root = str(data_root)
+        if not absolute_mode:
+            configured_data_root = os.path.relpath(data_root, REPO_ROOT)
         config = {
             'reorganize_config': str(REPO_ROOT / 'configs' / 'reorganize_frame_images.json'),
             'slicer_config': str(REPO_ROOT / 'configs' / 'spacetime_slicer.json'),
-            'data_root': str(data_root),
+            'data_root': configured_data_root,
             'output_dir': None,
         }
         config_path.write_text(json.dumps(config), encoding='utf-8')
@@ -32,6 +36,7 @@ class BatchRunTest(unittest.TestCase):
     def test_sub_dir_selects_all_unprocessed_datasets_in_time_order(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             data_root = Path(temp_dir) / 'data'
+            (data_root / '0630' / '130-2026-06-30-150000').mkdir(parents=True)
             (data_root / '0630' / 'QPA-2026-06-30-161131').mkdir(parents=True)
             (data_root / '0630' / 'QPB-2026-06-30-172000').mkdir(parents=True)
             (data_root / '0630' / 'QPC-2026-06-30-181500').mkdir(parents=True)
@@ -45,10 +50,14 @@ class BatchRunTest(unittest.TestCase):
             self.assertEqual(
                 [Path(path) for path in args.datasets_to_process],
                 [
+                    (data_root / '0630' / '130-2026-06-30-150000').resolve(),
                     (data_root / '0630' / 'QPA-2026-06-30-161131').resolve(),
                     (data_root / '0630' / 'QPC-2026-06-30-181500').resolve(),
                 ],
             )
+            self.assertFalse(args.data_root_is_absolute)
+            self.assertEqual(Path(args.batch_input_root), data_root / '0630')
+            self.assertEqual(Path(args.batch_output_root), data_root / '0630' / 'Slicers')
 
     def test_datasets_selects_only_named_unprocessed_dataset(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -96,6 +105,179 @@ class BatchRunTest(unittest.TestCase):
                     (data_root / '0630' / 'QPC-2026-06-30-181500').resolve(),
                 ],
             )
+
+    def test_absolute_data_root_replaces_date_and_filters_non_qp_directories(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            shared_root = Path(temp_dir)
+            configured_root = shared_root / '0717' / '关键帧'
+            qpa = configured_root / 'QPA-2026-07-17-144135'
+            qpb = configured_root / 'QPB-2026-07-17-150000'
+            qpc = configured_root / 'QPC-2026-07-17-160000'
+            ignored = configured_root / '130-2026-07-17-144135'
+            ignored_lowercase = configured_root / 'qpd-2026-07-17-170000'
+            qpa.mkdir(parents=True)
+            qpb.mkdir()
+            qpc.mkdir()
+            ignored.mkdir()
+            ignored_lowercase.mkdir()
+            done_dir = (
+                shared_root
+                / '0717'
+                / '风暴时刻输出'
+                / qpb.name
+            )
+            done_dir.mkdir(parents=True)
+            (done_dir / 'slicer.mp4').write_bytes(b'done')
+            empty_output_dir = (
+                shared_root
+                / '0717'
+                / '风暴时刻输出'
+                / qpc.name
+            )
+            empty_output_dir.mkdir(parents=True)
+            (empty_output_dir / 'slicer.mp4').write_bytes(b'')
+            config_path = self.make_batch_config(
+                temp_dir,
+                configured_root,
+                absolute_mode=True,
+            )
+
+            args, _ = parse_args(['--config', str(config_path), '--sub_dir', '0717'])
+
+            self.assertTrue(args.data_root_is_absolute)
+            self.assertEqual(Path(args.batch_input_root), configured_root)
+            self.assertEqual(
+                Path(args.batch_output_root),
+                shared_root / '0717' / '风暴时刻输出',
+            )
+            self.assertEqual(
+                [Path(path) for path in args.datasets_to_process],
+                [qpa.resolve(), qpc.resolve()],
+            )
+            self.assertEqual(
+                [Path(path) for path in args.output_dirs_to_process],
+                [
+                    shared_root / '0717' / '风暴时刻输出' / qpa.name,
+                    shared_root / '0717' / '风暴时刻输出' / qpc.name,
+                ],
+            )
+
+    def test_command_line_data_root_override_determines_absolute_mode(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            configured_relative_root = Path(temp_dir) / 'relative-data'
+            configured_relative_root.mkdir()
+            absolute_root = Path(temp_dir) / '0717' / '关键帧'
+            selected = absolute_root / 'QPA-2026-07-17-144135'
+            selected.mkdir(parents=True)
+            config_path = self.make_batch_config(temp_dir, configured_relative_root)
+
+            args, _ = parse_args([
+                '--config', str(config_path),
+                '--data_root', str(absolute_root),
+                '--sub_dir', '0717',
+            ])
+
+            self.assertTrue(args.data_root_is_absolute)
+            self.assertEqual(Path(args.batch_input_root), absolute_root)
+            self.assertEqual(
+                Path(args.batch_output_root),
+                Path(temp_dir) / '0717' / '风暴时刻输出',
+            )
+            self.assertEqual(Path(args.datasets_to_process[0]), selected.resolve())
+
+    def test_absolute_data_root_uses_sub_dir_for_both_input_and_output_dates(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            shared_root = Path(temp_dir)
+            configured_root = shared_root / '0717' / '关键帧'
+            selected = shared_root / '0718' / '关键帧' / 'QPA-2026-07-18-144135'
+            selected.mkdir(parents=True)
+            config_path = self.make_batch_config(
+                temp_dir,
+                configured_root,
+                absolute_mode=True,
+            )
+
+            args, _ = parse_args(['--config', str(config_path), '--sub_dir', '0718'])
+
+            self.assertEqual(
+                Path(args.batch_input_root),
+                shared_root / '0718' / '关键帧',
+            )
+            self.assertEqual(
+                Path(args.batch_output_root),
+                shared_root / '0718' / '风暴时刻输出',
+            )
+            self.assertEqual(Path(args.datasets_to_process[0]), selected.resolve())
+            self.assertEqual(
+                Path(args.output_dirs_to_process[0]),
+                shared_root / '0718' / '风暴时刻输出' / selected.name,
+            )
+
+    def test_absolute_mode_rejects_explicit_non_qp_dataset(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            configured_root = Path(temp_dir) / '0717' / '关键帧'
+            (configured_root / '130-2026-07-17-144135').mkdir(parents=True)
+            config_path = self.make_batch_config(
+                temp_dir,
+                configured_root,
+                absolute_mode=True,
+            )
+
+            with self.assertRaises(SystemExit):
+                parse_args([
+                    '--config', str(config_path),
+                    '--sub_dir', '0717',
+                    '--datasets', '130-2026-07-17-144135',
+                ])
+
+    def test_absolute_mode_routes_multiple_outputs_to_storm_output_directory(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            shared_root = Path(temp_dir)
+            configured_root = shared_root / '0717' / '关键帧'
+            names = (
+                'QPA-2026-07-17-144135',
+                'QPB-2026-07-17-150000',
+            )
+            for name in names:
+                (configured_root / name).mkdir(parents=True)
+            config_path = self.make_batch_config(
+                temp_dir,
+                configured_root,
+                absolute_mode=True,
+            )
+            args, slicer_args = parse_args([
+                '--config', str(config_path),
+                '--sub_dir', '0717',
+                '--force',
+            ])
+            slicer_calls = []
+
+            result = run_pipeline(
+                args,
+                slicer_args,
+                slicer_main=lambda argv: slicer_calls.append(argv) or 0,
+                structure_checker=lambda *args, **kwargs: True,
+            )
+
+            self.assertEqual(result, 0)
+            self.assertEqual(len(slicer_calls), 2)
+            for name, argv in zip(names, slicer_calls):
+                output_index = argv.index('--output_dir') + 1
+                self.assertEqual(
+                    Path(argv[output_index]),
+                    shared_root / '0717' / '风暴时刻输出' / name,
+                )
+
+    def test_rejects_sub_dir_containing_path_components(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            data_root = Path(temp_dir) / 'data'
+            config_path = self.make_batch_config(temp_dir, data_root)
+
+            with self.assertRaises(SystemExit):
+                parse_args([
+                    '--config', str(config_path),
+                    '--sub_dir', '../0717',
+                ])
 
     def test_routes_reorganize_and_slicer_overrides(self):
         args, slicer_args = parse_args([
