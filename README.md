@@ -47,7 +47,7 @@ SpacetimeSlicer/
 
 - Git for Windows
 - [uv](https://docs.astral.sh/uv/) —— Python 包管理与虚拟环境工具
-- **FFmpeg（必需的系统依赖）** —— 程序通过 FFmpeg stdin 直接将原始帧编码为 H.264；未安装时无法生成 `slicer.mp4`
+- **FFmpeg（必需的系统依赖）** —— 程序通过 FFmpeg stdin 直接将原始帧编码为 H.264；未安装时无法生成最终 MP4
 - 使用 CUDA 后端时，安装与所选 PyTorch Wheel 兼容的 NVIDIA 驱动
 - 使用 RIFE 时，显卡驱动需要提供 Vulkan 支持
 
@@ -395,7 +395,7 @@ python build_spacetime_slicer.py `
 默认生成：
 
 ```text
-results/QP-2026-06-25-152530/slicer.mp4
+results/QP-2026-06-25-152530/QP-2026-06-25-152530.mp4
 ```
 
 完整示例：
@@ -536,7 +536,7 @@ data/
 ├── QP-2026-06-25-152530/
 └── Slicers/
     └── QP-2026-06-25-152530/
-        └── slicer.mp4
+        └── QP-2026-06-25-152530.mp4
 ```
 
 可显式指定输出：
@@ -559,7 +559,7 @@ data/
     └── QPC-2026-06-30-181500/
 ```
 
-处理 `0630` 下所有尚未生成 `slicer.mp4` 的数据集：
+处理 `0630` 下所有尚未生成“与数据集目录同名 MP4”的数据集：
 
 ```powershell
 python batch_run.py --sub_dir 0630
@@ -582,7 +582,7 @@ python batch_run.py --sub_dir 0630 --force
 批量模式输出到：
 
 ```text
-data/0630/Slicers/<数据集名>/slicer.mp4
+data/0630/Slicers/<数据集名>/<数据集名>.mp4
 ```
 
 Python/OpenCV 生成的每一帧会通过 stdin 直接传给 FFmpeg，并由 `libx264`
@@ -599,7 +599,7 @@ winget install --id Gyan.FFmpeg -e
 `slicer_mp4v.mp4`，最终只保留：
 
 ```text
-<输出目录>/slicer.mp4
+<输出目录>/<输出目录名>.mp4
 ```
 
 当 `data_root` 使用绝对路径模板，例如 `Y:/0717/关键帧` 时，`--sub_dir`
@@ -611,7 +611,13 @@ python batch_run.py --sub_dir 0717
 
 ```text
 输入：Y:/0717/关键帧/<QP数据集名>
-输出：Y:/0717/风暴时刻输出/<QP数据集名>/slicer.mp4
+输出：Y:/0717/风暴时刻输出/<QP数据集名>/<QP数据集名>.mp4
+```
+
+例如：
+
+```text
+Y:/0718/风暴时刻输出/QPA-2026-07-18-103215/QPA-2026-07-18-103215.mp4
 ```
 
 改为 `--sub_dir 0718` 后，输入和输出会同时切换为 `Y:/0718/...`；不会在
@@ -647,7 +653,7 @@ python batch_run.py `
 | `--data_root` | 相对批处理根目录，或形如 `Y:/0717/关键帧` 的绝对输入路径模板；默认 `data/` |
 | `--sub_dir` | 批次日期目录；绝对路径模式下同时替换输入和输出的日期段 |
 | `--datasets` | 只处理指定数据集名称 |
-| `--force` | 忽略已有 `slicer.mp4` 并重新处理 |
+| `--force` | 忽略已有的同目录名 MP4 并重新处理 |
 | `--output_dir` | 单数据集输出目录 |
 | `--reorganize-config` | 重组器 JSON 配置 |
 | `--slicer-config` | 切片器 JSON 配置 |
@@ -744,7 +750,7 @@ python build_spacetime_slicer.py `
   --rife_model_dir .\third_party\rife-ncnn-vulkan\rife-v4.6
 ```
 
-### FFmpeg 无法创建 `slicer.mp4`
+### FFmpeg 无法创建最终 MP4
 
 项目将 OpenCV/Numpy 生成的 BGR 帧直接写入 FFmpeg，由 `libx264` 编码为
 H.264。先运行 `ffmpeg -version`，或通过 `--ffmpeg_exe` 指定

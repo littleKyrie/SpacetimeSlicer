@@ -43,7 +43,7 @@ python batch_run.py --sub_dir 0717
 batch_dir  = <repo>/data/0717
 input_dir  = <repo>/data/0717/<dataset_name>
 output_dir = <repo>/data/0717/Slicers/<dataset_name>
-video      = <repo>/data/0717/Slicers/<dataset_name>/slicer.mp4
+video      = <repo>/data/0717/Slicers/<dataset_name>/<dataset_name>.mp4
 ```
 
 这一分支继续沿用当前数据集发现规则、排序规则、`--datasets`、`--force` 和已有结果跳过规则，避免影响项目内已有工作流。
@@ -84,7 +84,7 @@ batch_dir       = date_dir / input_leaf               # Y:/0717/关键帧
 output_root     = date_dir / 风暴时刻输出              # Y:/0717/风暴时刻输出
 input_dir       = batch_dir / dataset_name
 output_dir      = output_root / dataset_name
-video           = output_dir / slicer.mp4
+video           = output_dir / f"{dataset_name}.mp4"
 ```
 
 对应关系必须严格为：
@@ -92,11 +92,11 @@ video           = output_dir / slicer.mp4
 ```text
 --sub_dir 0717
   输入：Y:/0717/关键帧/<QP目录名>
-  输出：Y:/0717/风暴时刻输出/<QP目录名>/slicer.mp4
+  输出：Y:/0717/风暴时刻输出/<QP目录名>/<QP目录名>.mp4
 
 --sub_dir 0718
   输入：Y:/0718/关键帧/<QP目录名>
-  输出：Y:/0718/风暴时刻输出/<QP目录名>/slicer.mp4
+  输出：Y:/0718/风暴时刻输出/<QP目录名>/<QP目录名>.mp4
 ```
 
 例如配置仍为 `Y:/0717/关键帧`，但执行：
@@ -141,31 +141,31 @@ QP-2026-07-17-160000/
 
 ```text
 输入：Y:/0717/关键帧/QPA-2026-07-17-144135
-输出：Y:/0717/风暴时刻输出/QPA-2026-07-17-144135/slicer.mp4
+输出：Y:/0717/风暴时刻输出/QPA-2026-07-17-144135/QPA-2026-07-17-144135.mp4
 ```
 
-最终视频名继续固定为：
+最终视频名与输出目录名保持一致：
 
 ```text
-slicer.mp4
+<dataset_name>.mp4
 ```
 
 一个数据集仅在下列文件存在且大小大于 `0` 时视为已完成：
 
 ```text
-<该模式推导出的 output_dir>/slicer.mp4
+<该模式推导出的 output_dir>/<dataset_name>.mp4
 ```
 
 因此绝对路径模式检查：
 
 ```text
-Y:/0717/风暴时刻输出/<dataset_name>/slicer.mp4
+Y:/0717/风暴时刻输出/<dataset_name>/<dataset_name>.mp4
 ```
 
 相对路径模式仍检查：
 
 ```text
-<repo>/data/0717/Slicers/<dataset_name>/slicer.mp4
+<repo>/data/0717/Slicers/<dataset_name>/<dataset_name>.mp4
 ```
 
 `--force` 继续只控制是否忽略该完成判定，不改变候选目录范围和输出路径。
@@ -253,7 +253,7 @@ def discover_datasets(input_root: Path, qp_only: bool) -> list[Path]:
 2. 使用 `data_root + --sub_dir + 模式` 一次性解析 `input_root` 与 `output_root`。
 3. 未传 `--datasets` 时，从 `input_root` 发现候选；绝对模式仅保留 `QP*`。
 4. 传了 `--datasets` 时，在 `input_root` 下构造指定候选，并在绝对模式校验 `QP*`、存在性和目录类型。
-5. 对每个候选使用 `output_root / dataset_name` 检查 `slicer.mp4`。
+5. 对每个候选检查 `output_root / dataset_name / f"{dataset_name}.mp4"`。
 6. 未传 `--force` 时跳过已有非空结果；传入时保留候选。
 7. 执行时将同一个已解析输出目录传给切片程序，确保不会在 `run_pipeline()` 中重新用 `input_dir.parent / Slicers` 覆盖它。
 
@@ -326,9 +326,9 @@ Will process N dataset(s).
 
 - 原始 `data_root = "data"` 时仍判定为相对模式，即使内部规范化后是绝对路径。
 - `--sub_dir 0717` 仍从 `<repo>/data/0717` 读取。
-- 输出仍为 `<repo>/data/0717/Slicers/<dataset>/slicer.mp4`。
+- 输出为 `<repo>/data/0717/Slicers/<dataset>/<dataset>.mp4`。
 - 不新增 `QP` 限制，现有普通目录发现行为保持不变。
-- 已有非空 `slicer.mp4`、空文件、`--force`、多数据集排序和 `--datasets` 行为均不回归。
+- 已有非空同目录名 MP4、空文件、`--force`、多数据集排序和 `--datasets` 行为均不回归。
 
 ### 绝对路径路径推导
 
@@ -342,7 +342,7 @@ Will process N dataset(s).
 - 同时存在 `130-*`、`QPA-*`、`QP-*` 时，只发现后两者。
 - 小写 `qp-*` 不匹配大写 `QP` 规则。
 - `--datasets 130-*` 明确报错。
-- 输出 `Y:/0717/风暴时刻输出/QPA-.../slicer.mp4` 非空时跳过对应输入。
+- 输出 `Y:/0717/风暴时刻输出/QPA-.../QPA-....mp4` 非空时跳过对应输入。
 - 输出文件为空时仍选择处理。
 - `--force` 可重跑已有结果，但仍排除非 `QP*` 目录。
 - 多个候选实际传入切片程序的输出目录分别位于同一个 `风暴时刻输出` 下，且保留各自完整目录名。
@@ -379,8 +379,8 @@ python batch_run.py --sub_dir 0717
 
 - 只读取 `Y:/0717/关键帧` 中名称以 `QP` 开头的一级数据目录；
 - 不读取 `130-2026-07-17-144135` 等非 `QP` 目录；
-- 每个结果保存为 `Y:/0717/风暴时刻输出/<原始QP目录名>/slicer.mp4`；
-- 数据集目录名和 `slicer.mp4` 文件名与当前保持一致；
+- 每个结果保存为 `Y:/0717/风暴时刻输出/<原始QP目录名>/<原始QP目录名>.mp4`；
+- 数据集目录名和视频文件名保持一致，例如 `QPA-2026-07-18-103215/QPA-2026-07-18-103215.mp4`；
 - 将命令改成 `--sub_dir 0718` 时，仅路径中的 `0717` 日期目录变为 `0718`；
-- `--sub_dir 0718` 时输入必须来自 `Y:/0718/关键帧/<QP目录名>`，输出必须写入 `Y:/0718/风暴时刻输出/<QP目录名>/slicer.mp4`，输入和输出日期始终一致；
+- `--sub_dir 0718` 时输入必须来自 `Y:/0718/关键帧/<QP目录名>`，输出必须写入 `Y:/0718/风暴时刻输出/<QP目录名>/<QP目录名>.mp4`，输入和输出日期始终一致；
 - 将 `data_root` 恢复为 `"data"` 后，所有原有项目内读取和输出路径保持不变。

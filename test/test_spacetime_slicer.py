@@ -7,7 +7,7 @@ import cv2
 import numpy as np
 
 from build_spacetime_slicer import build_parser, normalize_cli_frame_args, parse_frame_ids
-from models.spacetime_slicer import SpacetimeSlicer
+from models.spacetime_slicer import SpacetimeSlicer, resolve_output_video_path
 
 
 class FrameCollector:
@@ -48,6 +48,14 @@ def make_slicer(frames, rife_interpolator=None):
 
 
 class SpacetimeSlicerTest(unittest.TestCase):
+    def test_output_video_filename_matches_output_directory(self):
+        output_dir = Path('风暴时刻输出') / 'QPA-2026-07-18-103215'
+
+        self.assertEqual(
+            Path(resolve_output_video_path(output_dir)),
+            output_dir / 'QPA-2026-07-18-103215.mp4',
+        )
+
     def test_cli_frame_ids_are_one_based_source_frame_ids(self):
         args = build_parser().parse_args([
             '--input_dir', 'data',

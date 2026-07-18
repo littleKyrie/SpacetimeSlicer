@@ -11,6 +11,13 @@ from utils.opencv_io import imread_required
 FRAME_DIR_PATTERN = re.compile(r'^\d+$')
 
 
+def resolve_output_video_path(output_dir):
+    output_name = os.path.basename(os.path.normpath(output_dir))
+    if not output_name:
+        raise ValueError(f"Cannot derive video name from output directory: {output_dir}")
+    return os.path.join(output_dir, f"{output_name}.mp4")
+
+
 class SpacetimeSlicer:
     def __init__(self, input_dir, output_root, fps=25, camera_ids=None,
                  rife_interpolator=None):
@@ -609,7 +616,7 @@ class SpacetimeSlicer:
         output_dir = self.output_root
         os.makedirs(output_dir, exist_ok=True)
 
-        video_path = os.path.join(output_dir, "slicer.mp4")
+        video_path = resolve_output_video_path(output_dir)
         print(f"Output video: {video_path}")
         print(
             f"H.264 encoding: libx264, CRF {h264_crf}, preset {h264_preset} "

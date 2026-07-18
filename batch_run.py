@@ -147,7 +147,7 @@ def build_parser(config_defaults=None):
     parser.add_argument(
         '--force',
         action='store_true',
-        help='Re-run even if the dataset output slicer.mp4 already exists.',
+        help='Re-run even if the dataset-named output MP4 already exists.',
     )
     parser.add_argument(
         '--output_dir',
@@ -184,8 +184,13 @@ def dataset_output_dir(output_root, input_dir):
     return output_root / input_dir.name
 
 
+def dataset_video_path(output_dir):
+    output_dir = Path(output_dir)
+    return output_dir / f'{output_dir.name}.mp4'
+
+
 def output_already_exists(output_dir):
-    video_path = output_dir / 'slicer.mp4'
+    video_path = dataset_video_path(output_dir)
     return video_path.is_file() and video_path.stat().st_size > 0
 
 

@@ -4,10 +4,18 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from batch_run import REPO_ROOT, parse_args, run_pipeline
+from batch_run import REPO_ROOT, dataset_video_path, parse_args, run_pipeline
 
 
 class BatchRunTest(unittest.TestCase):
+    def test_video_filename_matches_dataset_output_directory(self):
+        output_dir = Path('风暴时刻输出') / 'QPA-2026-07-18-103215'
+
+        self.assertEqual(
+            dataset_video_path(output_dir),
+            output_dir / 'QPA-2026-07-18-103215.mp4',
+        )
+
     def make_batch_config(self, temp_dir, data_root, absolute_mode=False):
         config_path = Path(temp_dir) / 'batch.json'
         configured_data_root = str(data_root)
@@ -42,7 +50,7 @@ class BatchRunTest(unittest.TestCase):
             (data_root / '0630' / 'QPC-2026-06-30-181500').mkdir(parents=True)
             done_dir = data_root / '0630' / 'Slicers' / 'QPB-2026-06-30-172000'
             done_dir.mkdir(parents=True)
-            (done_dir / 'slicer.mp4').write_bytes(b'done')
+            (done_dir / f'{done_dir.name}.mp4').write_bytes(b'done')
             config_path = self.make_batch_config(temp_dir, data_root)
 
             args, _ = parse_args(['--config', str(config_path), '--sub_dir', '0630'])
@@ -127,7 +135,7 @@ class BatchRunTest(unittest.TestCase):
                 / qpb.name
             )
             done_dir.mkdir(parents=True)
-            (done_dir / 'slicer.mp4').write_bytes(b'done')
+            (done_dir / f'{done_dir.name}.mp4').write_bytes(b'done')
             empty_output_dir = (
                 shared_root
                 / '0717'
@@ -135,7 +143,7 @@ class BatchRunTest(unittest.TestCase):
                 / qpc.name
             )
             empty_output_dir.mkdir(parents=True)
-            (empty_output_dir / 'slicer.mp4').write_bytes(b'')
+            (empty_output_dir / f'{empty_output_dir.name}.mp4').write_bytes(b'')
             config_path = self.make_batch_config(
                 temp_dir,
                 configured_root,
