@@ -483,11 +483,36 @@ python build_spacetime_slicer.py `
 | `--background_mode` | `freeze` | 回收背景：`freeze`、`median` 或 `start` |
 | `--initial_canvas_mode` | `patched_start` | 初始画布：主体修补后的起始帧，或 `clean` 替换帧 |
 | `--initial_subject_patch_mode` | `freeze` | 起始主体替换来源：`none`、`median`、`freeze` 或 `frame` |
-| `--initial_subject_patch_frame` | 冻结帧 | `frame` 模式使用的源帧编号 |
+| `--initial_subject_patch_frame` | 冻结帧 | `frame` 模式使用的完整原始输入图片序号，从 1 开始 |
+| `--source_sequence_dir` | 自动 | 完整原始图片顺序目录；批处理自动使用重组器生成的 `重命名数据` |
 | `--initial_patch_alpha_threshold` | `1` | 起始主体修补 Alpha 阈值，范围 0–255 |
 | `--initial_patch_dilate` | `1` | 修补掩码膨胀像素数 |
 | `--live_subject_alpha_threshold` | `16` | 当前主体保留阈值，范围 0–255 |
 | `--live_subject_opacity` | `1.0` | 当前主体不透明度，范围 0–1 |
+
+`initial_subject_patch_mode=frame` 的编号不再使用合成后的时间轴帧数，而是使用
+重组前全部输入图片的顺序编号。假设原始输入共 239 张图片，重组后的合成时间轴
+只有 148 或 149 帧，仍然可以使用 `1–239` 中的任意编号，包括中间的环形相机
+图片。例如选择原始输入中的第 200 张：
+
+```json
+{
+  "initial_subject_patch_mode": "frame",
+  "initial_subject_patch_frame": 200
+}
+```
+
+批处理会自动将 `<数据集目录>/重命名数据` 传给切片器，其中 `000.jpg` 对应参数
+`1`、`199.jpg` 对应参数 `200`、`238.jpg` 对应参数 `239`。如果直接运行
+`build_spacetime_slicer.py` 且顺序目录不是默认的 `重命名数据`，需要显式传入：
+
+```powershell
+python build_spacetime_slicer.py `
+  --source_sequence_dir <完整原始图片顺序目录> `
+  --initial_subject_patch_mode frame `
+  --initial_subject_patch_frame 200 `
+  ...
+```
 
 ### 调试导出
 

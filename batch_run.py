@@ -409,13 +409,22 @@ def build_reorganize_argv(args, source_dir):
     return argv
 
 
-def build_slicer_argv(args, slicer_args, source_dir, output_dir):
-    return [
+def build_slicer_argv(
+    args,
+    slicer_args,
+    source_dir,
+    output_dir,
+    source_sequence_dir=None,
+):
+    argv = [
         '--config', args.slicer_config,
         '--input_dir', source_dir,
         '--output_dir', output_dir,
-        *slicer_args,
     ]
+    if source_sequence_dir is not None:
+        argv.extend(['--source_sequence_dir', str(source_sequence_dir)])
+    argv.extend(slicer_args)
+    return argv
 
 
 def run_single_dataset(
@@ -428,7 +437,16 @@ def run_single_dataset(
     structure_checker=has_reorganized_frame_structure,
 ):
     reorganize_args = parse_reorganize_args(build_reorganize_argv(args, source_dir))
-    slicer_argv = build_slicer_argv(args, slicer_args, source_dir, output_dir)
+    source_sequence_dir = (
+        Path(source_dir) / reorganize_args.normalized_dir_name
+    )
+    slicer_argv = build_slicer_argv(
+        args,
+        slicer_args,
+        source_dir,
+        output_dir,
+        source_sequence_dir=source_sequence_dir,
+    )
     normalize_cli_frame_args(build_slicer_parser().parse_args(slicer_argv))
 
     print(f'Input directory: {source_dir}')

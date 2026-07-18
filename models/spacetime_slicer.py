@@ -9,6 +9,7 @@ from utils.opencv_io import imread_required
 
 
 FRAME_DIR_PATTERN = re.compile(r'^\d+$')
+SOURCE_IMAGE_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.bmp', '.webp'}
 
 
 def resolve_output_video_path(output_dir):
@@ -20,13 +21,20 @@ def resolve_output_video_path(output_dir):
 
 class SpacetimeSlicer:
     def __init__(self, input_dir, output_root, fps=25, camera_ids=None,
-                 rife_interpolator=None):
+                 rife_interpolator=None, source_sequence_dir=None):
         self.input_dir = input_dir
         self.output_root = output_root
         self.fps = fps
         self.camera_ids = camera_ids if camera_ids is not None else [0]
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         self.rife_interpolator = rife_interpolator
+
+        if source_sequence_dir is None:
+            default_source_sequence_dir = os.path.join(input_dir, '重命名数据')
+            if os.path.isdir(default_source_sequence_dir):
+                source_sequence_dir = default_source_sequence_dir
+        self.source_sequence_dir = source_sequence_dir
+        self.source_image_paths = self.discover_source_image_paths(source_sequence_dir)
 
         # Only numeric subdirectories are frame directories. Generated helper
         # folders such as 重命名数据/ and 原始图片/ must not be indexed as frames.
@@ -60,6 +68,48 @@ class SpacetimeSlicer:
         print(f"找到 {self.total_frames} 帧")
         for cam_id in self.camera_ids:
             print(f"  机位 {cam_id}: {len(self.frame_paths_dict[cam_id])} 帧")
+        if self.source_image_paths:
+            print(f"  原始输入序列: {len(self.source_image_paths)} 张")
+
+    @staticmethod
+    def discover_source_image_paths(source_sequence_dir):
+        if source_sequence_dir is None:
+            return []
+        source_dir = os.fspath(source_sequence_dir)
+        if not os.path.isdir(source_dir):
+            return []
+        paths = [
+            os.path.join(source_dir, name)
+            for name in os.listdir(source_dir)
+            if os.path.isfile(os.path.join(source_dir, name))
+            and os.path.splitext(name)[1].lower() in SOURCE_IMAGE_EXTENSIONS
+        ]
+        return sorted(
+            paths,
+            key=lambda path: (
+                0,
+                int(os.path.splitext(os.path.basename(path))[0]),
+            ) if os.path.splitext(os.path.basename(path))[0].isdigit() else (
+                1,
+                os.path.basename(path),
+            ),
+        )
+
+    def validate_source_image_index(self, image_idx):
+        if not self.source_image_paths:
+            raise ValueError(
+                'initial_subject_patch_mode=frame requires the complete original '
+                'image sequence. Pass --source_sequence_dir or run through batch_run.py.'
+            )
+        if not 0 <= image_idx < len(self.source_image_paths):
+            raise ValueError(
+                'initial_subject_patch_frame must be between 1 and '
+                f'{len(self.source_image_paths)}, got {image_idx + 1}'
+            )
+
+    def read_source_image(self, image_idx):
+        self.validate_source_image_index(image_idx)
+        return imread_required(self.source_image_paths[image_idx])
 
     def has_frame(self, idx, camera_id):
         frame_paths_by_frame = getattr(self, 'frame_paths_by_frame_dict', None)
@@ -144,9 +194,7 @@ class SpacetimeSlicer:
             return self.read_frame(freeze_idx, camera_id).copy()
         if mode == 'frame':
             resolved_patch_idx = freeze_idx if patch_frame_idx is None else patch_frame_idx
-            if resolved_patch_idx >= len(self.frame_paths_dict[camera_id]):
-                raise ValueError(f"Camera {camera_id} does not contain patch frame {resolved_patch_idx}")
-            return self.read_frame(resolved_patch_idx, camera_id).copy()
+            return self.read_source_image(resolved_patch_idx).copy()
         raise ValueError(f"Unknown initial subject patch mode: {mode}")
 
     def patch_initial_subject_region(self, base_frame, replacement_frame, alpha_mask,
@@ -605,6 +653,13 @@ class SpacetimeSlicer:
         for frame_idx in range(freeze_idx + 1, effect_end_idx):
             if not self.has_frame(frame_idx, tail_cam):
                 raise ValueError(f"Camera {tail_cam} does not contain tail frame {frame_idx}")
+        if initial_subject_patch_mode == 'frame':
+            patch_image_idx = (
+                freeze_idx
+                if initial_subject_patch_frame is None
+                else initial_subject_patch_frame
+            )
+            self.validate_source_image_index(patch_image_idx)
 
         # Old verbose run directory retained for reference:
         # patch_suffix = initial_subject_patch_mode

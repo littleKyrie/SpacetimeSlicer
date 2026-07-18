@@ -321,6 +321,12 @@ class BatchRunTest(unittest.TestCase):
         self.assertIn('--end_frame', calls['slicer'])
         self.assertIn('180', calls['slicer'])
         self.assertIn('./custom-output', calls['slicer'])
+        self.assertIn('--source_sequence_dir', calls['slicer'])
+        source_sequence_index = calls['slicer'].index('--source_sequence_dir') + 1
+        self.assertEqual(
+            Path(calls['slicer'][source_sequence_index]),
+            REPO_ROOT / 'data' / 'source' / '重命名数据',
+        )
 
     def test_invalid_slicer_option_is_rejected_before_reorganization(self):
         args, slicer_args = parse_args([

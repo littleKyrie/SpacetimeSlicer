@@ -277,6 +277,13 @@ def build_parser():
     )
     parser.add_argument('--input_dir')
     parser.add_argument('--output_dir', '--output_root', dest='output_dir')
+    parser.add_argument(
+        '--source_sequence_dir',
+        help=(
+            'Directory containing the complete normalized original image sequence; '
+            'used by initial_subject_patch_mode=frame.'
+        ),
+    )
     parser.add_argument('--camera_ids', default='0', help='Comma-separated IDs or inclusive range, such as 1:30 (its id corresponds to the actual file id in the subdir)')
     parser.add_argument('--fps', type=int, default=25, help='FPS of the output video')
     parser.add_argument('--start_frame', type=int, help='1-based source frame ID where ghost effects start, inclusive.')
@@ -288,7 +295,14 @@ def build_parser():
     parser.add_argument('--ghost_opacity_start', type=float, default=0.2)
     parser.add_argument('--ghost_opacity_end', type=float, default=1.0)
     parser.add_argument('--initial_subject_patch_mode', default='freeze', choices=['none', 'median', 'freeze', 'frame'], help='Background source for removing the start-frame subject before overlaying the first translucent slice')
-    parser.add_argument('--initial_subject_patch_frame', type=int, help='Manual 1-based source frame ID used when --initial_subject_patch_mode frame; defaults to --freeze_frame')
+    parser.add_argument(
+        '--initial_subject_patch_frame',
+        type=int,
+        help=(
+            '1-based image number in the complete original input sequence when '
+            '--initial_subject_patch_mode frame; defaults to --freeze_frame.'
+        ),
+    )
     parser.add_argument('--initial_canvas_mode', default='patched_start', choices=['patched_start', 'clean'], help='Initial canvas for patched_canvas mode: patched_start uses start_frame with the subject region replaced; clean starts from the replacement frame')
     parser.add_argument('--initial_patch_alpha_threshold', type=int, default=1, help='Alpha threshold used to remove the start-frame subject from the first output frame')
     parser.add_argument('--initial_patch_dilate', type=int, default=1, help='Dilate the start-frame subject patch mask to remove edge residue')
@@ -366,6 +380,7 @@ def main(argv=None):
             fps=args.fps,
             camera_ids=camera_ids,
             rife_interpolator=rife_interpolator,
+            source_sequence_dir=args.source_sequence_dir,
         )
         print(f'Device: {slicer.device}')
         if args.end_frame is None:

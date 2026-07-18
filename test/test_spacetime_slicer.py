@@ -37,11 +37,14 @@ class FakeRifeInterpolator:
         return cv2.addWeighted(first_frame, 1.0 - timestep, second_frame, timestep, 0)
 
 
-def make_slicer(frames, rife_interpolator=None):
+def make_slicer(frames, rife_interpolator=None, source_frames=None):
     slicer = SpacetimeSlicer.__new__(SpacetimeSlicer)
     slicer.camera_ids = [0]
     slicer.frame_paths_dict = {0: list(range(len(frames)))}
     slicer.read_frame = lambda idx, camera_id=None: frames[idx].copy()
+    source_frames = frames if source_frames is None else source_frames
+    slicer.source_image_paths = list(range(len(source_frames)))
+    slicer.read_source_image = lambda idx: source_frames[idx].copy()
     slicer.rife_interpolator = rife_interpolator
     slicer.fps = 25
     return slicer
@@ -312,6 +315,31 @@ class SpacetimeSlicerTest(unittest.TestCase):
         replacement = slicer.resolve_initial_subject_replacement('frame', 0, 1)
 
         self.assertEqual(int(replacement[0, 0, 0]), 20)
+
+    def test_manual_patch_frame_uses_complete_original_image_sequence(self):
+        timeline_frames = [np.zeros((1, 1, 3), dtype=np.uint8) for _ in range(149)]
+        source_frames = [
+            np.full((1, 1, 3), image_number, dtype=np.uint8)
+            for image_number in range(1, 240)
+        ]
+        slicer = make_slicer(timeline_frames, source_frames=source_frames)
+
+        replacement = slicer.resolve_initial_subject_replacement(
+            'frame',
+            camera_id=0,
+            freeze_idx=124,
+            patch_frame_idx=199,
+        )
+
+        self.assertEqual(len(slicer.source_image_paths), 239)
+        self.assertEqual(int(replacement[0, 0, 0]), 200)
+
+    def test_manual_patch_frame_reports_original_sequence_range(self):
+        slicer = SpacetimeSlicer.__new__(SpacetimeSlicer)
+        slicer.source_image_paths = list(range(239))
+
+        with self.assertRaisesRegex(ValueError, 'between 1 and 239'):
+            slicer.read_source_image(239)
 
     def test_recovery_trajectory_uses_fractional_smoothstep_positions(self):
         slicer = SpacetimeSlicer.__new__(SpacetimeSlicer)

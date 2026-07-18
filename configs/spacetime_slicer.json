@@ -1,6 +1,7 @@
 {
   "input_dir": null,
   "output_dir": null,
+  "source_sequence_dir": null,
   "camera_ids": "1:90",
   "fps": 25,
   "start_frame": 25,
