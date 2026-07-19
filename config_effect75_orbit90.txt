@@ -1,0 +1,109 @@
+SpacetimeSlicer：前 75 帧全部作为特效段、无片头、90 机位环绕配置
+====================================================================
+
+目标
+----
+1. 合成时间轴第 1 帧就开始切片特效，不保留普通片头段。
+2. 第 75 帧完成切片回收，并从该帧进入多机位凝结环绕。
+3. 环绕实际使用机位 1 至 90。
+4. 环绕结束后继续播放片尾，直到当前数据的最后一帧。
+
+核心参数
+--------
+
+预处理参数（reorganize_frame_images）：
+
+    pre-frame-count = 75
+    camera_count = 90
+
+切片参数（spacetime_slicer）：
+
+    start_frame = 1
+    freeze_frame = 75
+    end_frame = null
+    camera_ids = 1:90
+
+保持默认即可的相关参数：
+
+    stretch_head = 1
+    stretch_ghost = 1
+    stretch_fade = 1
+    stretch_freeze = 1
+    stretch_tail = 1
+    freeze_interp_mode = rife
+    recovery_timing = after_freeze
+
+命令行直接运行
+--------------
+
+将 0719 替换成实际日期目录，调用示例如下：
+
+    uv run python batch_run.py `
+      --sub_dir 0719 `
+      --pre-frame-count 75 `
+      --start_frame 1 `
+      --freeze_frame 75 `
+      --initial_subject_patch_mode frame `
+      --initial_subject_patch_frame xx `
+      --force
+
+当前 configs/spacetime_slicer.json 中 end_frame 必须保持：
+
+    "end_frame": null
+
+这样程序会自动使用重组后起始机位的最后一帧作为结束帧。
+
+JSON 配置片段
+-------------
+
+configs/reorganize_frame_images.json：
+
+    {
+      "pre_frame_count": 75,
+      "camera_count": 90,
+      "original_dir_name": "原始图片",
+      "normalized_dir_name": "重命名数据",
+      "image_ext": ".jpg",
+      "dry_run": false
+    }
+
+configs/spacetime_slicer.json 中对应字段：
+
+    {
+      "camera_ids": "1:90",
+      "start_frame": 1,
+      "freeze_frame": 75,
+      "end_frame": null
+    }
+
+准确的帧含义
+------------
+
+- start_frame=1：内部索引为 0，因此片头循环为空，视频从第一帧直接进入特效段。
+- pre_frame_count=75：重组目录 0075 是唯一包含多机位图片的冻结帧目录。
+- freeze_frame=75：必须与 pre_frame_count=75 保持一致，否则指定冻结帧中没有完整机位图片。
+- camera_ids=1:90：最终环绕依次使用 001.jpg 至 090.jpg，共 90 个机位视角。
+- end_frame=null：环绕结束后，片尾自动播放到重组时间轴的最后一帧。
+
+对于 N 张原始输入图片，camera_count=90 时：
+
+    重组后的起始机位时间轴总帧数 = N - 90
+
+例如仍然有 239 张原始图片：
+
+    重组时间轴总帧数 = 239 - 90 = 149
+    特效时间轴       = 第 1 至 75 帧
+    凝结环绕         = 在冻结帧 75 上依次输出 camera_ids 1:90
+    片尾时间轴       = 第 76 至 149 帧
+
+重要使用限制
+------------
+
+1. pre-frame-count 和 camera_count 属于数据重组参数。
+2. 如果数据已经按 125/90 完成重组，不能只加 --force 改成 75/90。
+3. --force 只控制是否重新生成视频，不会把现有重组结构安全地改成另一套结构。
+4. 首次使用 75/90 配置时，应从一份尚未重组的原始数据目录重新运行。
+5. 数据已经按 75/90 重组后，可以使用 --force 调整 start_frame、end_frame、
+   ghost_interval、stretch_* 等切片参数，但 pre_frame_count、camera_count 和
+   freeze_frame 必须继续与现有重组结构匹配。
+6. 对同一个输出目录使用 --force 会覆盖同名的最终 MP4。
