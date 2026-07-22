@@ -1,7 +1,6 @@
 import argparse
 import json
 import os
-import sys
 import time
 from pathlib import Path
 
@@ -378,34 +377,20 @@ def build_parser():
     parser.add_argument(
         '--centroid-mask',
         action=argparse.BooleanOptionalAction,
-        default=False,
+        default=True,
         help='Use alpha centroid (not bbox center) as the ghost geometry anchor '
-             'during recovery. Recommended for rembg-* methods.',
+             'during recovery (default: True). Disable with --no-centroid-mask '
+             'to revert to bbox-center behaviour.',
     )
     parser.add_argument('--method', default='RVM',
                         help='RVM, Hybrid, SAM2_BBox, RMBG2, or rembg-<model>')
     return parser
 
 
-def argv_has_option(argv, *options):
-    tokens = sys.argv[1:] if argv is None else list(argv)
-    for token in tokens:
-        for option in options:
-            if token == option or token.startswith(f'{option}='):
-                return True
-    return False
-
 
 def main(argv=None):
     start_time = time.time()
     args = normalize_cli_frame_args(build_parser().parse_args(argv))
-
-    centroid_explicit = (
-        argv_has_option(argv, '--centroid-mask', '--no-centroid-mask')
-    )
-    if not centroid_explicit and args.method.startswith('rembg-'):
-        args.centroid_mask = True
-        print('[centroid-mask] auto-enabled for rembg method')
 
     camera_ids = parse_camera_ids(args.camera_ids)
     print(f'Camera IDs: {camera_ids}')

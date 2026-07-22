@@ -43,16 +43,16 @@ SpacetimeSlicer：前 75 帧全部作为特效段、无片头、90 机位环绕�
       --pre-frame-count 75 `
       --start_frame 1 `
       --freeze_frame 75 `
-      --dataset QPG_88-2026-07-22-132757 `
-      --initial_subject_patch_frame 138
-      
+      --dataset QPG_88-2026-07-22-213643 `
+      --initial_subject_patch_frame 127 `
+      --centroid-mask
+
     uv run python batch_run.py `
       --sub_dir 0722 `
       --pre-frame-count 75 `
       --start_frame 1 `
       --freeze_frame 75 `
-      --dataset QPG_88-2026-07-22-132810
-
+      --datasets QPB_75-2026-07-22-213900
 
 0722update:为测试分割手持扇子，对  QPG_88-2026-07-22-091351  +rembg 方法进行测试
 
@@ -61,8 +61,7 @@ SpacetimeSlicer：前 75 帧全部作为特效段、无片头、90 机位环绕�
       --pre-frame-count 75 `
       --start_frame 1 `
       --freeze_frame 75 `
-      --dataset QPG_88-2026-07-22-091351 `
-      --initial_subject_patch_frame 134 `
+      --dataset QPG_88-2026-07-22-183133 `
       --method rembg-isnet-general-use
 
 
