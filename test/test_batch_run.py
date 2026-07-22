@@ -72,7 +72,7 @@ class BatchRunTest(unittest.TestCase):
         )
         self.assertEqual(slicer_args, [])
 
-    def test_sub_dir_selects_all_unprocessed_datasets_in_time_order(self):
+    def test_sub_dir_selects_all_datasets_in_time_order_regardless_of_existing_output(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             data_root = Path(temp_dir) / 'data'
             (data_root / '0630' / '130-2026-06-30-150000').mkdir(parents=True)
@@ -91,6 +91,7 @@ class BatchRunTest(unittest.TestCase):
                 [
                     (data_root / '0630' / '130-2026-06-30-150000').resolve(),
                     (data_root / '0630' / 'QPA-2026-06-30-161131').resolve(),
+                    (data_root / '0630' / 'QPB-2026-06-30-172000').resolve(),
                     (data_root / '0630' / 'QPC-2026-06-30-181500').resolve(),
                 ],
             )
@@ -98,7 +99,7 @@ class BatchRunTest(unittest.TestCase):
             self.assertEqual(Path(args.batch_input_root), data_root / '0630')
             self.assertEqual(Path(args.batch_output_root), data_root / '0630' / 'Slicers')
 
-    def test_datasets_selects_only_named_unprocessed_dataset(self):
+    def test_datasets_selects_only_named_dataset(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             data_root = Path(temp_dir) / 'data'
             selected = data_root / '0630' / 'QPA-2026-06-30-161131'
@@ -191,12 +192,13 @@ class BatchRunTest(unittest.TestCase):
             )
             self.assertEqual(
                 [Path(path) for path in args.datasets_to_process],
-                [qpa.resolve(), qpc.resolve()],
+                [qpa.resolve(), qpb.resolve(), qpc.resolve()],
             )
             self.assertEqual(
                 [Path(path) for path in args.output_dirs_to_process],
                 [
                     shared_root / '0717' / '风暴时刻输出' / qpa.name,
+                    shared_root / '0717' / '风暴时刻输出' / qpb.name,
                     shared_root / '0717' / '风暴时刻输出' / qpc.name,
                 ],
             )

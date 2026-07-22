@@ -59,6 +59,45 @@ class SpacetimeSlicerTest(unittest.TestCase):
             output_dir / 'QPA-2026-07-18-103215.mp4',
         )
 
+    def test_output_video_auto_increment_when_mp4_exists(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output_dir = Path(temp_dir) / 'QPA-2026-07-18-103215'
+            output_dir.mkdir(parents=True)
+            # Create existing non-empty mp4
+            base_mp4 = output_dir / 'QPA-2026-07-18-103215.mp4'
+            base_mp4.write_bytes(b'existing')
+
+            self.assertEqual(
+                Path(resolve_output_video_path(str(output_dir))),
+                output_dir / 'QPA-2026-07-18-103215-1.mp4',
+            )
+
+    def test_output_video_auto_increment_skips_empty_mp4(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output_dir = Path(temp_dir) / 'QPA-2026-07-18-103215'
+            output_dir.mkdir(parents=True)
+            # Create empty mp4 (should be treated as non-existent)
+            base_mp4 = output_dir / 'QPA-2026-07-18-103215.mp4'
+            base_mp4.write_bytes(b'')
+
+            self.assertEqual(
+                Path(resolve_output_video_path(str(output_dir))),
+                output_dir / 'QPA-2026-07-18-103215.mp4',
+            )
+
+    def test_output_video_auto_increment_multiple_existing(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output_dir = Path(temp_dir) / 'QPA-2026-07-18-103215'
+            output_dir.mkdir(parents=True)
+            # Create base and -1 mp4
+            (output_dir / 'QPA-2026-07-18-103215.mp4').write_bytes(b'existing')
+            (output_dir / 'QPA-2026-07-18-103215-1.mp4').write_bytes(b'existing')
+
+            self.assertEqual(
+                Path(resolve_output_video_path(str(output_dir))),
+                output_dir / 'QPA-2026-07-18-103215-2.mp4',
+            )
+
     def test_cli_frame_ids_are_one_based_source_frame_ids(self):
         args = build_parser().parse_args([
             '--input_dir', 'data',
@@ -71,6 +110,7 @@ class SpacetimeSlicerTest(unittest.TestCase):
 
         normalize_cli_frame_args(args)
 
+        self.assertEqual(args.initial_subject_patch_mode, 'frame')
         self.assertEqual(args.start_frame, 24)
         self.assertEqual(args.freeze_frame, 124)
         self.assertEqual(args.end_frame, 149)
@@ -78,6 +118,37 @@ class SpacetimeSlicerTest(unittest.TestCase):
         self.assertEqual(args.source_start_frame, 25)
         self.assertEqual(args.source_freeze_frame, 125)
         self.assertEqual(args.source_end_frame, 149)
+
+    def test_initial_subject_patch_frame_auto_switches_mode_to_frame(self):
+        """--initial_subject_patch_frame implies frame mode without needing --initial_subject_patch_mode."""
+        args = build_parser().parse_args([
+            '--input_dir', 'data',
+            '--output_dir', 'results',
+            '--start_frame', '1',
+            '--freeze_frame', '75',
+            '--initial_subject_patch_frame', '99',
+        ])
+        # Before normalization: mode should still be default 'freeze'
+        self.assertEqual(args.initial_subject_patch_mode, 'freeze')
+
+        normalize_cli_frame_args(args)
+
+        self.assertEqual(args.initial_subject_patch_mode, 'frame')
+        self.assertEqual(args.initial_subject_patch_frame, 98)  # 1-based → 0-based
+
+    def test_initial_subject_patch_mode_unchanged_without_frame_arg(self):
+        """Without --initial_subject_patch_frame, the mode keeps its explicit value."""
+        for mode in ('freeze', 'none', 'median'):
+            with self.subTest(mode=mode):
+                args = build_parser().parse_args([
+                    '--input_dir', 'data',
+                    '--output_dir', 'results',
+                    '--start_frame', '1',
+                    '--freeze_frame', '75',
+                    '--initial_subject_patch_mode', mode,
+                ])
+                normalize_cli_frame_args(args)
+                self.assertEqual(args.initial_subject_patch_mode, mode)
 
     def test_cli_frame_ids_reject_zero(self):
         args = build_parser().parse_args([

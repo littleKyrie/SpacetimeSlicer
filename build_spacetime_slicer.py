@@ -1,6 +1,7 @@
 import argparse
 import json
 import os
+import sys
 import time
 from pathlib import Path
 
@@ -114,6 +115,9 @@ def parse_frame_ids(value):
 
 def normalize_cli_frame_args(args):
     """Convert 1-based source frame IDs from the CLI to internal frame indices."""
+    if args.initial_subject_patch_frame is not None:
+        args.initial_subject_patch_mode = 'frame'
+
     frame_values = {
         'start_frame': args.start_frame,
         'freeze_frame': args.freeze_frame,
@@ -299,14 +303,33 @@ def build_parser():
         '--initial_subject_patch_frame',
         type=int,
         help=(
-            '1-based image number in the complete original input sequence when '
-            '--initial_subject_patch_mode frame; defaults to --freeze_frame.'
+            '1-based image number in the complete original input sequence; '
+            'automatically sets initial_subject_patch_mode to frame. '
+            'Defaults to --freeze_frame when omitted.'
         ),
     )
     parser.add_argument('--initial_canvas_mode', default='patched_start', choices=['patched_start', 'clean'], help='Initial canvas for patched_canvas mode: patched_start uses start_frame with the subject region replaced; clean starts from the replacement frame')
     parser.add_argument('--initial_patch_alpha_threshold', type=int, default=1, help='Alpha threshold used to remove the start-frame subject from the first output frame')
     parser.add_argument('--initial_patch_dilate', type=int, default=1, help='Dilate the start-frame subject patch mask to remove edge residue')
-    parser.add_argument('--live_subject_alpha_threshold', type=int, default=16, help='Alpha threshold for keeping the current live subject opaque in patched_canvas mode')
+    parser.add_argument(
+        '--live_subject_alpha_threshold',
+        type=int,
+        default=16,
+        help=(
+            'Alpha threshold (0-255) that serves two related purposes in '
+            'patched_canvas mode: '
+            '(1) Live-subject mask — pixels with alpha above this value are '
+            'rendered as the current-frame person, covering the canvas. '
+            '(2) Ghost-burn filter — only pixels with alpha above this value '
+            'are burned into the persistent canvas during ghost frames, '
+            'preventing low-confidence edge noise from accumulating. '
+            'Using one threshold for both keeps the burned-canvas footprint '
+            'and the live-subject mask spatially aligned, avoiding edge '
+            'fringing around the subject. Adjust upward if you see semi-'
+            'transparent halos at body edges; downward if ghost silhouettes '
+            'are clipped too aggressively.'
+        ),
+    )
     parser.add_argument('--live_subject_opacity', type=float, default=1.0, help='Opacity of the current live subject in patched_canvas mode')
     parser.add_argument('--effect_base_mode', default='patched_canvas', choices=['patched_canvas', 'source'], help='patched_canvas mattes the current subject every frame; source uses each original frame as the base and only mattes slice frames')
     parser.add_argument('--debug_extract_frames', help='Write RVM alpha/cutout diagnostics for comma-separated frames or an inclusive range, then exit')
@@ -352,14 +375,38 @@ def build_parser():
     )
     parser.add_argument('--h264_crf', type=int, default=18, help='libx264 CRF (0-51).')
     parser.add_argument('--h264_preset', default='medium', help='libx264 encoding preset.')
+    parser.add_argument(
+        '--centroid-mask',
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help='Use alpha centroid (not bbox center) as the ghost geometry anchor '
+             'during recovery. Recommended for rembg-* methods.',
+    )
     parser.add_argument('--method', default='RVM',
                         help='RVM, Hybrid, SAM2_BBox, RMBG2, or rembg-<model>')
     return parser
 
 
+def argv_has_option(argv, *options):
+    tokens = sys.argv[1:] if argv is None else list(argv)
+    for token in tokens:
+        for option in options:
+            if token == option or token.startswith(f'{option}='):
+                return True
+    return False
+
+
 def main(argv=None):
     start_time = time.time()
     args = normalize_cli_frame_args(build_parser().parse_args(argv))
+
+    centroid_explicit = (
+        argv_has_option(argv, '--centroid-mask', '--no-centroid-mask')
+    )
+    if not centroid_explicit and args.method.startswith('rembg-'):
+        args.centroid_mask = True
+        print('[centroid-mask] auto-enabled for rembg method')
+
     camera_ids = parse_camera_ids(args.camera_ids)
     print(f'Camera IDs: {camera_ids}')
 
@@ -432,6 +479,7 @@ def main(argv=None):
             effect_base_mode=args.effect_base_mode,
             live_subject_opacity=args.live_subject_opacity,
             live_subject_alpha_threshold=args.live_subject_alpha_threshold,
+            centroid_mask=args.centroid_mask,
             ffmpeg_executable=args.ffmpeg_exe,
             h264_crf=args.h264_crf,
             h264_preset=args.h264_preset,

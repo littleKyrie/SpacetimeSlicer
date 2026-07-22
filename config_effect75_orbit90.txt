@@ -43,18 +43,28 @@ SpacetimeSlicer：前 75 帧全部作为特效段、无片头、90 机位环绕�
       --pre-frame-count 75 `
       --start_frame 1 `
       --freeze_frame 75 `
-      --dataset QPB_75-2026-07-22-085332 `
-      --initial_subject_patch_mode frame `
-      --initial_subject_patch_frame 99`
-      --force
+      --dataset QPG_88-2026-07-22-132757 `
+      --initial_subject_patch_frame 138
       
     uv run python batch_run.py `
       --sub_dir 0722 `
       --pre-frame-count 75 `
       --start_frame 1 `
       --freeze_frame 75 `
-      --dataset QPG_88-2026-07-22-092745 `
-      --force
+      --dataset QPG_88-2026-07-22-132810
+
+
+0722update:为测试分割手持扇子，对  QPG_88-2026-07-22-091351  +rembg 方法进行测试
+
+    uv run python batch_run.py `
+      --sub_dir 0722 `
+      --pre-frame-count 75 `
+      --start_frame 1 `
+      --freeze_frame 75 `
+      --dataset QPG_88-2026-07-22-091351 `
+      --initial_subject_patch_frame 134 `
+      --method rembg-isnet-general-use
+
 
 当前 configs/spacetime_slicer.json 中 end_frame 必须保持：
 

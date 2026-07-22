@@ -370,28 +370,16 @@ def resolve_dataset_candidates(parser, args):
             )
         except (FileNotFoundError, NotADirectoryError) as exc:
             parser.error(str(exc))
-        if args.force:
-            candidates = discovered
-        else:
-            candidates = [
-                path for path in discovered
-                if not output_already_exists(
-                    dataset_output_dir(batch_paths.output_root, path)
-                )
-            ]
+        candidates = discovered
 
     selected = []
     selected_outputs = []
     selected_pre_frame_counts = []
-    skipped = []
     for candidate in candidates:
         if args.output_dir_explicit and len(candidates) == 1:
             output_dir = Path(args.output_dir).expanduser()
         else:
             output_dir = dataset_output_dir(batch_paths.output_root, candidate)
-        if not args.force and output_already_exists(output_dir):
-            skipped.append(str(candidate))
-            continue
         try:
             pre_frame_count = parse_dataset_pre_frame_count(candidate.name)
         except ValueError as exc:
@@ -403,7 +391,6 @@ def resolve_dataset_candidates(parser, args):
     args.datasets_to_process = selected
     args.output_dirs_to_process = selected_outputs
     args.dataset_pre_frame_counts = selected_pre_frame_counts
-    args.skipped_datasets = skipped
 
 
 def parse_args(argv=None):
@@ -549,11 +536,7 @@ def run_pipeline(
         print(f'Output root: {batch_output_root}')
 
     if not datasets:
-        skipped = getattr(args, 'skipped_datasets', [])
-        if skipped:
-            print(f'All specified datasets already processed ({len(skipped)} skipped).')
-        else:
-            print('All datasets already processed.')
+        print('No datasets to process.')
         return 0
 
     output_dirs = getattr(args, 'output_dirs_to_process', None) or []

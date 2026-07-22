@@ -16,7 +16,15 @@ def resolve_output_video_path(output_dir):
     output_name = os.path.basename(os.path.normpath(output_dir))
     if not output_name:
         raise ValueError(f"Cannot derive video name from output directory: {output_dir}")
-    return os.path.join(output_dir, f"{output_name}.mp4")
+    base_path = os.path.join(output_dir, f"{output_name}.mp4")
+    if not os.path.isfile(base_path) or os.path.getsize(base_path) == 0:
+        return base_path
+    index = 1
+    while True:
+        candidate = os.path.join(output_dir, f"{output_name}-{index}.mp4")
+        if not os.path.isfile(candidate) or os.path.getsize(candidate) == 0:
+            return candidate
+        index += 1
 
 
 class SpacetimeSlicer:
@@ -256,25 +264,75 @@ class SpacetimeSlicer:
             y = component_stats[primary_label, cv2.CC_STAT_TOP]
             w = component_stats[primary_label, cv2.CC_STAT_WIDTH]
             h = component_stats[primary_label, cv2.CC_STAT_HEIGHT]
-            geometry = np.array([x + w / 2.0, y + h / 2.0, float(w), float(h)], dtype=np.float32)
+            if getattr(self, 'use_centroid', False):
+                moments = cv2.moments(binary_alpha)
+                if moments['m00'] > 0:
+                    cx = moments['m10'] / moments['m00']
+                    cy = moments['m01'] / moments['m00']
+                else:
+                    cx = x + w / 2.0
+                    cy = y + h / 2.0
+                geometry = np.array([cx, cy, float(w), float(h)], dtype=np.float32)
+            else:
+                geometry = np.array([x + w / 2.0, y + h / 2.0, float(w), float(h)], dtype=np.float32)
         ghost['geometry'] = geometry
         return geometry
+
+    @staticmethod
+    def _get_alpha_bbox(alpha_mask):
+        """Return (x, y, w, h) bounding box of the largest alpha-connected foreground."""
+        binary_alpha = (alpha_mask > 8).astype(np.uint8)
+        component_count, _, component_stats, _ = cv2.connectedComponentsWithStats(
+            binary_alpha, connectivity=8
+        )
+        if component_count <= 1:
+            h, w = alpha_mask.shape
+            return 0, 0, w, h
+        primary_label = 1 + int(
+            np.argmax(component_stats[1:, cv2.CC_STAT_AREA])
+        )
+        return (
+            component_stats[primary_label, cv2.CC_STAT_LEFT],
+            component_stats[primary_label, cv2.CC_STAT_TOP],
+            component_stats[primary_label, cv2.CC_STAT_WIDTH],
+            component_stats[primary_label, cv2.CC_STAT_HEIGHT],
+        )
 
     def align_ghost_to_center(self, ghost, target_center):
         """Translate a cutout to the interpolated center without changing its body proportions."""
         frame_h, frame_w = ghost['alpha'].shape
         source_geometry = self.get_ghost_geometry(ghost)
-        source_w = max(1, int(round(source_geometry[2])))
-        source_h = max(1, int(round(source_geometry[3])))
-        source_x = int(round(source_geometry[0] - source_w / 2.0))
-        source_y = int(round(source_geometry[1] - source_h / 2.0))
+
+        if getattr(self, 'use_centroid', False):
+            # Centroid anchor: crop from bbox, place centroid at target_center.
+            bbox_x, bbox_y, bbox_w, bbox_h = self._get_alpha_bbox(ghost['alpha'])
+            source_x, source_y = bbox_x, bbox_y
+            source_w, source_h = bbox_w, bbox_h
+            # source_geometry[0:2] is the centroid (cx, cy).
+            # Compute the offset from bbox top-left to the centroid,
+            # then use it to place the centroid at target_center.
+            centroid_x = source_geometry[0]
+            centroid_y = source_geometry[1]
+            offset_x = centroid_x - bbox_x
+            offset_y = centroid_y - bbox_y
+            target_x = int(round(target_center[0] - offset_x))
+            target_y = int(round(target_center[1] - offset_y))
+        else:
+            source_w = max(1, int(round(source_geometry[2])))
+            source_h = max(1, int(round(source_geometry[3])))
+            source_x = int(round(source_geometry[0] - source_w / 2.0))
+            source_y = int(round(source_geometry[1] - source_h / 2.0))
+            source_x = min(max(0, source_x), frame_w - 1)
+            source_y = min(max(0, source_y), frame_h - 1)
+            source_w = min(source_w, frame_w - source_x)
+            source_h = min(source_h, frame_h - source_y)
+            target_x = int(round(target_center[0] - source_w / 2.0))
+            target_y = int(round(target_center[1] - source_h / 2.0))
+
         source_x = min(max(0, source_x), frame_w - 1)
         source_y = min(max(0, source_y), frame_h - 1)
         source_w = min(source_w, frame_w - source_x)
         source_h = min(source_h, frame_h - source_y)
-
-        target_x = int(round(target_center[0] - source_w / 2.0))
-        target_y = int(round(target_center[1] - source_h / 2.0))
 
         frame_crop = ghost['frame'][source_y:source_y + source_h, source_x:source_x + source_w]
         alpha_crop = ghost['alpha'][source_y:source_y + source_h, source_x:source_x + source_w]
@@ -350,8 +408,28 @@ class SpacetimeSlicer:
             if should_be_ghost:
                 g_opacity = ghost_opacities[min(ghost_count, len(ghost_opacities) - 1)]
                 if effect_base_mode == 'patched_canvas':
+                    # ---- Ghost burn into the persistent canvas ----
+                    #
+                    # The canvas accumulates ghost cutouts across frames and
+                    # later shows through wherever the live-subject mask is 0.
+                    # Only pixels whose alpha exceeds live_subject_alpha_threshold
+                    # are burned in, so the canvas footprint and the live-subject
+                    # mask share the same confidence boundary.  Without this
+                    # filter, low-alpha edge noise (common with per-frame
+                    # segmentation models like rembg) would compound on the
+                    # canvas and become visible as a translucent fringe around
+                    # the live subject.
+                    #
+                    # The FULL alpha mask is still stored in all_ghosts below
+                    # so that the recovery phase can use continuous alpha for
+                    # smooth ghost fade-outs.
                     alpha_normalized = np.repeat(alpha_mask[:, :, np.newaxis], 3, axis=2) / 255.0
-                    ghost_alpha = alpha_normalized * g_opacity
+                    burn_mask = alpha_mask > live_subject_alpha_threshold
+                    ghost_alpha = np.where(
+                        burn_mask[:, :, np.newaxis],
+                        alpha_normalized * g_opacity,
+                        0.0,
+                    )
                     canvas_ghosts = (
                         current_frame * ghost_alpha +
                         canvas_ghosts * (1 - ghost_alpha)
@@ -370,6 +448,14 @@ class SpacetimeSlicer:
                     base_frame, all_ghosts, permanent_indices
                 )
             else:
+                # ---- Live-subject compositing over the canvas ----
+                #
+                # Pixels with alpha above live_subject_alpha_threshold are
+                # considered "live subject" and rendered from the current
+                # frame, covering the canvas beneath.  This threshold is
+                # intentionally the same value used in the ghost-burn filter
+                # above, so the burned-canvas footprint and the live mask are
+                # spatially aligned (both use the same confidence boundary).
                 live_mask = (alpha_mask > live_subject_alpha_threshold).astype(np.float32)
                 live_alpha = np.repeat(live_mask[:, :, np.newaxis], 3, axis=2) * live_subject_opacity
                 frame_output = (
@@ -580,6 +666,7 @@ class SpacetimeSlicer:
                  effect_base_mode='patched_canvas',
                  live_subject_opacity=1.0,
                  live_subject_alpha_threshold=16,
+                 centroid_mask=False,
                  ffmpeg_executable=None,
                  h264_crf=18,
                  h264_preset='medium'):
@@ -589,9 +676,12 @@ class SpacetimeSlicer:
         流程:
           1. 片头: 0 -> effect_start_idx（固定机位原样播放）
           2. 特效段: effect_start_idx -> slice_end_idx（残影+透明度渐变）
-             - 每个输出帧以原始视频帧为底
-             - 只在 ghost_interval 命中的帧分割人物并捕获为透明切片
-             - 已捕获切片按各自 opacity 叠加到当前原始帧上
+             - 残影捕获时以 alpha 遮罩切割人物
+             - 残影以 ghost-burn 方式叠加到持久 canvas 上
+               (仅 alpha > live_subject_alpha_threshold 的像素参与烧入)
+             - 每帧输出时 live-subject mask 使用同一阈值判定人物区域
+               (alpha > threshold → 显示当前人物; 否则 → 透出 canvas 残影)
+             - 两处共用同一阈值保证 canvas 足迹与人物 mask 空间对齐
           3. 回收窗口: slice_end_idx+1 -> freeze_idx（回收所有残影）
           4. 凝结转场: 按 camera_ids 顺序输出各机位 freeze_idx 帧
           5. 继续播放: freeze_idx+1 -> effect_end_idx（终止机位原样播放）
@@ -633,6 +723,7 @@ class SpacetimeSlicer:
             raise ValueError(f"Unknown freeze interpolation mode: {freeze_interp_mode}")
         if not 0 <= h264_crf <= 51:
             raise ValueError("h264_crf must be between 0 and 51")
+        self.use_centroid = centroid_mask
         resolved_ffmpeg = resolve_ffmpeg_executable(ffmpeg_executable)
         start_cam = camera_ids[0]
         end_cam = camera_ids[-1]
