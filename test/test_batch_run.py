@@ -4,10 +4,41 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from batch_run import REPO_ROOT, dataset_video_path, parse_args, run_pipeline
+from batch_run import (
+    REPO_ROOT,
+    dataset_video_path,
+    parse_args,
+    parse_dataset_pre_frame_count,
+    run_pipeline,
+)
 
 
 class BatchRunTest(unittest.TestCase):
+    def test_parses_optional_pre_frame_count_from_qp_dataset_name(self):
+        self.assertEqual(
+            parse_dataset_pre_frame_count('QPA_75-2026-07-19-103215'),
+            75,
+        )
+        self.assertEqual(
+            parse_dataset_pre_frame_count('QPB_125-2026-07-19-103215'),
+            125,
+        )
+        self.assertIsNone(
+            parse_dataset_pre_frame_count('QPA-2026-07-19-103215')
+        )
+        self.assertIsNone(
+            parse_dataset_pre_frame_count('130_75-2026-07-19-103215')
+        )
+
+    def test_rejects_invalid_dataset_pre_frame_count(self):
+        for name in (
+            'QPA_0-2026-07-19-103215',
+            'QPA_-75-2026-07-19-103215',
+            'QPA_abc-2026-07-19-103215',
+        ):
+            with self.subTest(name=name), self.assertRaises(ValueError):
+                parse_dataset_pre_frame_count(name)
+
     def test_video_filename_matches_dataset_output_directory(self):
         output_dir = Path('风暴时刻输出') / 'QPA-2026-07-18-103215'
 
@@ -275,6 +306,138 @@ class BatchRunTest(unittest.TestCase):
                     Path(argv[output_index]),
                     shared_root / '0717' / '风暴时刻输出' / name,
                 )
+
+    def test_dataset_name_frame_count_overrides_only_matching_dataset(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            shared_root = Path(temp_dir)
+            configured_root = shared_root / '0719' / '关键帧'
+            names = (
+                'QPA_75-2026-07-19-103215',
+                'QPB-2026-07-19-113215',
+            )
+            for name in names:
+                (configured_root / name).mkdir(parents=True)
+            config_path = self.make_batch_config(
+                temp_dir,
+                configured_root,
+                absolute_mode=True,
+            )
+            args, slicer_args = parse_args([
+                '--config', str(config_path),
+                '--sub_dir', '0719',
+                '--force',
+            ])
+            checked_pre_frame_counts = []
+            slicer_calls = []
+
+            def fake_checker(input_dir, **kwargs):
+                checked_pre_frame_counts.append(kwargs['pre_frame_count'])
+                return True
+
+            result = run_pipeline(
+                args,
+                slicer_args,
+                slicer_main=lambda argv: slicer_calls.append(argv) or 0,
+                structure_checker=fake_checker,
+            )
+
+            self.assertEqual(result, 0)
+            self.assertEqual(checked_pre_frame_counts, [75, 125])
+            self.assertEqual(len(slicer_calls), 2)
+
+            def last_option_value(argv, option):
+                index = max(i for i, value in enumerate(argv) if value == option)
+                return argv[index + 1]
+
+            self.assertEqual(last_option_value(slicer_calls[0], '--start_frame'), '1')
+            self.assertEqual(last_option_value(slicer_calls[0], '--freeze_frame'), '75')
+            self.assertNotIn('--start_frame', slicer_calls[1])
+            self.assertNotIn('--freeze_frame', slicer_calls[1])
+            self.assertEqual(
+                Path(
+                    slicer_calls[0][slicer_calls[0].index('--output_dir') + 1]
+                ).name,
+                names[0],
+            )
+
+    def test_explicit_frame_parameters_override_dataset_name_metadata(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            shared_root = Path(temp_dir)
+            configured_root = shared_root / '0719' / '关键帧'
+            dataset = configured_root / 'QPG_86-2026-07-19-200535'
+            dataset.mkdir(parents=True)
+            config_path = self.make_batch_config(
+                temp_dir,
+                configured_root,
+                absolute_mode=True,
+            )
+            args, slicer_args = parse_args([
+                '--config', str(config_path),
+                '--sub_dir', '0719',
+                '--datasets', dataset.name,
+                '--force',
+                '--pre-frame-count', '75',
+                '--start_frame', '1',
+                '--freeze_frame', '75',
+            ])
+            checked_pre_frame_counts = []
+            slicer_calls = []
+
+            result = run_pipeline(
+                args,
+                slicer_args,
+                slicer_main=lambda argv: slicer_calls.append(argv) or 0,
+                structure_checker=lambda input_dir, **kwargs: (
+                    checked_pre_frame_counts.append(kwargs['pre_frame_count'])
+                    or True
+                ),
+            )
+
+            self.assertEqual(result, 0)
+            self.assertEqual(checked_pre_frame_counts, [75])
+            self.assertEqual(slicer_calls[0].count('--start_frame'), 1)
+            self.assertEqual(slicer_calls[0].count('--freeze_frame'), 1)
+            self.assertEqual(
+                slicer_calls[0][slicer_calls[0].index('--freeze_frame') + 1],
+                '75',
+            )
+
+    def test_single_explicit_frame_parameter_keeps_pre_and_freeze_in_sync(self):
+        args, slicer_args = parse_args([
+            '-s', './data/QPG_86-2026-07-19-200535',
+            '--pre-frame-count', '75',
+        ])
+        checked_pre_frame_counts = []
+        slicer_calls = []
+
+        result = run_pipeline(
+            args,
+            slicer_args,
+            slicer_main=lambda argv: slicer_calls.append(argv) or 0,
+            structure_checker=lambda input_dir, **kwargs: (
+                checked_pre_frame_counts.append(kwargs['pre_frame_count']) or True
+            ),
+        )
+
+        self.assertEqual(result, 0)
+        self.assertEqual(checked_pre_frame_counts, [75])
+        freeze_index = slicer_calls[0].index('--freeze_frame') + 1
+        self.assertEqual(slicer_calls[0][freeze_index], '75')
+
+    def test_rejects_conflicting_explicit_pre_and_freeze_frames(self):
+        args, slicer_args = parse_args([
+            '-s', './data/QPG_86-2026-07-19-200535',
+            '--pre-frame-count', '75',
+            '--freeze_frame', '76',
+        ])
+
+        with self.assertRaisesRegex(ValueError, 'must match'):
+            run_pipeline(
+                args,
+                slicer_args,
+                slicer_main=lambda argv: 0,
+                structure_checker=lambda *args, **kwargs: True,
+            )
 
     def test_rejects_sub_dir_containing_path_components(self):
         with tempfile.TemporaryDirectory() as temp_dir:

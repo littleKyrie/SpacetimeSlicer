@@ -23,6 +23,9 @@ DEFAULT_CONFIG_PATH = REPO_ROOT / 'configs' / 'spacetime_slicer_batch.json'
 DEFAULT_DATA_ROOT = REPO_ROOT / 'data'
 IGNORED_DATASET_DIRS = {'Slicer', 'Slicers', 'results', '__pycache__'}
 DATASET_TIME_PATTERN = re.compile(r'.*?(\d{4})-(\d{2})-(\d{2})-(\d{6})$')
+DATASET_TIMESTAMP_PATTERN = re.compile(
+    r'^(?P<prefix>QP.*)-(?P<timestamp>\d{4}-\d{2}-\d{2}-\d{6})$'
+)
 REORGANIZE_OVERRIDE_OPTIONS = {
     'pre_frame_count': '--pre-frame-count',
     'camera_count': '--camera-count',
@@ -202,6 +205,30 @@ def dataset_sort_key(path):
     return (1, path.name)
 
 
+def parse_dataset_pre_frame_count(dataset_name):
+    """Return the optional frame count encoded before a QP dataset timestamp."""
+    match = DATASET_TIMESTAMP_PATTERN.fullmatch(dataset_name)
+    if match is None:
+        return None
+
+    _, separator, frame_text = match.group('prefix').rpartition('_')
+    if not separator:
+        return None
+    if not frame_text.isdecimal():
+        raise ValueError(
+            'dataset frame count before the timestamp must be a positive integer: '
+            f'{dataset_name}'
+        )
+
+    frame_count = int(frame_text)
+    if frame_count < 1:
+        raise ValueError(
+            'dataset frame count before the timestamp must be at least 1: '
+            f'{dataset_name}'
+        )
+    return frame_count
+
+
 def discover_datasets(input_root, qp_only=False):
     if not input_root.exists():
         raise FileNotFoundError(f'batch directory does not exist: {input_root}')
@@ -294,6 +321,12 @@ def resolve_dataset_candidates(parser, args):
             args.output_dir = str(input_dir.parent / 'Slicers' / input_dir.name)
         args.datasets_to_process = [str(input_dir)]
         args.output_dirs_to_process = [args.output_dir]
+        try:
+            args.dataset_pre_frame_counts = [
+                parse_dataset_pre_frame_count(input_dir.name)
+            ]
+        except ValueError as exc:
+            parser.error(str(exc))
         args.batch_input_root = None
         args.batch_output_root = None
         return
@@ -349,6 +382,7 @@ def resolve_dataset_candidates(parser, args):
 
     selected = []
     selected_outputs = []
+    selected_pre_frame_counts = []
     skipped = []
     for candidate in candidates:
         if args.output_dir_explicit and len(candidates) == 1:
@@ -358,11 +392,17 @@ def resolve_dataset_candidates(parser, args):
         if not args.force and output_already_exists(output_dir):
             skipped.append(str(candidate))
             continue
+        try:
+            pre_frame_count = parse_dataset_pre_frame_count(candidate.name)
+        except ValueError as exc:
+            parser.error(str(exc))
         selected.append(str(candidate.resolve()))
         selected_outputs.append(str(output_dir))
+        selected_pre_frame_counts.append(pre_frame_count)
 
     args.datasets_to_process = selected
     args.output_dirs_to_process = selected_outputs
+    args.dataset_pre_frame_counts = selected_pre_frame_counts
     args.skipped_datasets = skipped
 
 
@@ -384,6 +424,16 @@ def parse_args(argv=None):
     args.source_dir_explicit = argv_has_option(argv, '-s', '--input_dir')
     args.output_dir_explicit = argv_has_option(argv, '--output_dir')
     args.data_root_explicit = argv_has_option(argv, '--data_root')
+    args.pre_frame_count_explicit = argv_has_option(argv, '--pre-frame-count')
+    args.start_frame_explicit = argv_has_option(slicer_args, '--start_frame')
+    args.freeze_frame_explicit = argv_has_option(slicer_args, '--freeze_frame')
+
+    explicit_frame_parser = argparse.ArgumentParser(add_help=False)
+    explicit_frame_parser.add_argument('--start_frame', type=int)
+    explicit_frame_parser.add_argument('--freeze_frame', type=int)
+    explicit_frame_args, _ = explicit_frame_parser.parse_known_args(slicer_args)
+    args.explicit_start_frame = explicit_frame_args.start_frame
+    args.explicit_freeze_frame = explicit_frame_args.freeze_frame
 
     if args.reorganize_config is None:
         parser.error('reorganize_config must be set in the batch config or command line')
@@ -507,6 +557,7 @@ def run_pipeline(
         return 0
 
     output_dirs = getattr(args, 'output_dirs_to_process', None) or []
+    dataset_pre_frame_counts = getattr(args, 'dataset_pre_frame_counts', None) or []
     print(f'Will process {len(datasets)} dataset(s).')
     for index, source_dir in enumerate(datasets):
         source_path = Path(source_dir)
@@ -516,9 +567,64 @@ def run_pipeline(
             output_dir = str(dataset_output_dir(Path(batch_output_root), source_path))
         else:
             output_dir = args.output_dir
+        pre_frame_count = (
+            dataset_pre_frame_counts[index]
+            if index < len(dataset_pre_frame_counts)
+            else parse_dataset_pre_frame_count(source_path.name)
+        )
+        dataset_args = argparse.Namespace(**vars(args))
+        dataset_slicer_args = list(slicer_args)
+        if pre_frame_count is not None:
+            manual_pre_frame_count = (
+                args.pre_frame_count
+                if args.pre_frame_count_explicit
+                else None
+            )
+            manual_freeze_frame = (
+                args.explicit_freeze_frame
+                if args.freeze_frame_explicit
+                else None
+            )
+            if (
+                manual_pre_frame_count is not None
+                and manual_freeze_frame is not None
+                and manual_pre_frame_count != manual_freeze_frame
+            ):
+                raise ReorganizationError(
+                    'explicit --pre-frame-count and --freeze_frame must match '
+                    f'for dataset {source_path.name}: '
+                    f'{manual_pre_frame_count} != {manual_freeze_frame}'
+                )
+
+            effective_frame_count = (
+                manual_pre_frame_count
+                if manual_pre_frame_count is not None
+                else manual_freeze_frame
+                if manual_freeze_frame is not None
+                else pre_frame_count
+            )
+            if not args.pre_frame_count_explicit:
+                dataset_args.pre_frame_count = effective_frame_count
+            if not args.start_frame_explicit:
+                dataset_slicer_args.extend(['--start_frame', '1'])
+            if not args.freeze_frame_explicit:
+                dataset_slicer_args.extend([
+                    '--freeze_frame', str(effective_frame_count)
+                ])
+            effective_start_frame = (
+                args.explicit_start_frame
+                if args.start_frame_explicit
+                else 1
+            )
+            print(
+                f'Dataset frame metadata: encoded={pre_frame_count}; effective '
+                f'pre_frame_count={effective_frame_count}, '
+                f'start_frame={effective_start_frame}, '
+                f'freeze_frame={effective_frame_count}'
+            )
         result = run_single_dataset(
-            args,
-            slicer_args,
+            dataset_args,
+            dataset_slicer_args,
             str(source_path),
             output_dir,
             reorganize_func=reorganize_func,

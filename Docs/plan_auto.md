@@ -135,6 +135,47 @@ QP-2026-07-17-160000/
 
 相对路径模式不新增 `QP` 前缀限制，保留当前兼容行为。
 
+### 2.4 从数据集目录名自动读取特效起始帧
+
+支持在 `QP` 数据集名称与末尾时间戳之间携带特效起始帧数。例如：
+
+```text
+QPA_75-2026-07-19-103215/
+```
+
+目录名使用以下完整结构时，解析时间戳前紧邻的十进制正整数：
+
+```text
+QP<数据标识>_<pre_frame_count>-YYYY-MM-DD-HHMMSS
+```
+
+实现时应对完整目录名进行严格匹配，等价正则可写为：
+
+```python
+r"^QP.*_(?P<frame>\d+)-(?P<timestamp>\d{4}-\d{2}-\d{2}-\d{6})$"
+```
+
+匹配 `QPA_75-2026-07-19-103215` 后，该数据集的有效参数必须自动设置为：
+
+```text
+pre_frame_count = 75     # 等价命令行 --pre-frame-count 75
+start_frame     = 1      # 等价切片参数 --start_frame 1
+freeze_frame    = 75     # 等价切片参数 --freeze_frame 75
+```
+
+`start_frame=1` 表示取消普通片头，从合成时间轴第一帧开始进入切片特效。
+
+规则约束如下：
+
+- 只读取末尾标准时间戳之前、由下划线和连字符包围的数字，不从时间戳、数据标识或路径的其他部分猜测帧数；
+- 解析结果必须大于 `0`，`_0-`、负数、空值和非数字均视为无效命名并在处理前明确报错；
+- `QPA-2026-07-19-103215` 等不携带该字段的普通名称继续使用命令行、JSON 和默认参数，行为保持不变；
+- 匹配后的目录名仍完整用于输入、输出目录和 MP4 命名，不删除 `_75`；
+- 该规则按数据集分别解析，同一批次允许不同目录使用不同帧数，不得修改共享的全局参数后污染后续数据集；
+- 参数优先级为：显式命令行参数 > 目录名元数据 > JSON 值和默认值；三个关联字段按各自是否显式传入决定是否覆盖，其他参数不受影响；
+- 若只显式传入 `--pre-frame-count` 或 `--freeze_frame` 之一，未显式传入的另一个参数自动跟随该手动值；若两者均显式传入但数值不同，则在预处理前明确报错；
+- 此命名规则只负责设置帧参数，不改变 `camera_count`、`camera_ids`、`end_frame` 或输出路径规则。
+
 ## 3. 输出命名与完成判定
 
 数据集原始目录名必须完整保留，不做缩写或重命名：
@@ -253,11 +294,31 @@ def discover_datasets(input_root: Path, qp_only: bool) -> list[Path]:
 2. 使用 `data_root + --sub_dir + 模式` 一次性解析 `input_root` 与 `output_root`。
 3. 未传 `--datasets` 时，从 `input_root` 发现候选；绝对模式仅保留 `QP*`。
 4. 传了 `--datasets` 时，在 `input_root` 下构造指定候选，并在绝对模式校验 `QP*`、存在性和目录类型。
-5. 对每个候选检查 `output_root / dataset_name / f"{dataset_name}.mp4"`。
-6. 未传 `--force` 时跳过已有非空结果；传入时保留候选。
-7. 执行时将同一个已解析输出目录传给切片程序，确保不会在 `run_pipeline()` 中重新用 `input_dir.parent / Slicers` 覆盖它。
+5. 对每个候选解析可选的 `_<帧数>-<时间戳>` 元数据，生成该数据集独立的有效参数；未携带时保留原参数。
+6. 对每个候选检查 `output_root / dataset_name / f"{dataset_name}.mp4"`。
+7. 未传 `--force` 时跳过已有非空结果；传入时保留候选。
+8. 执行时将同一个已解析输出目录和该候选独立的帧参数传给切片程序，确保不会在 `run_pipeline()` 中重新覆盖路径或把上一数据集的参数带入下一数据集。
 
 需要特别修正当前 `run_pipeline()` 的回退逻辑：批次包含多个数据集时，不能再无条件调用旧的 `dataset_output_dir(source_path)`；应为每个候选预先绑定或现场使用统一的 `output_root` 计算输出目录。
+
+### 4.5 生成每个数据集独立的帧参数
+
+新增纯解析函数，例如：
+
+```python
+def parse_dataset_pre_frame_count(dataset_name: str) -> int | None:
+    ...
+```
+
+在 `run_single_dataset()` 调用前复制基础预处理参数和切片参数。若返回正整数 `frame`，先结合显式命令行参数计算 `effective_frame`，再只对该副本设置未被手动指定的字段：
+
+```python
+dataset_preprocess_args.pre_frame_count = effective_frame
+dataset_slicer_args.start_frame = explicit_start_frame if explicitly_set else 1
+dataset_slicer_args.freeze_frame = effective_frame
+```
+
+上面的伪代码表示有效结果，实际实现应根据参数是否在命令行中显式出现来决定优先级。不得直接修改循环外共享的 `args` 或 `slicer_args`。这样批量处理 `QPA_75-...` 与 `QPB_125-...` 时，两者分别使用独立参数，执行顺序不会影响结果。
 
 ## 5. 参数行为
 
@@ -290,6 +351,20 @@ python batch_run.py --sub_dir 0717 --force
 - 绝对模式仍不会处理非 `QP*` 目录。
 - 日志应打印将重跑的数据集及其实际输出目录。
 
+### 配合目录名帧参数
+
+```powershell
+python batch_run.py --sub_dir 0719 --datasets QPA_75-2026-07-19-103215
+```
+
+该目录自动等价应用：
+
+```text
+--pre-frame-count 75 --start_frame 1 --freeze_frame 75
+```
+
+无需在命令行重复传入这三个值。目录名没有 `_数字-时间戳` 字段时，不启用自动覆盖。
+
 ### 显式单数据集模式
 
 ```powershell
@@ -306,6 +381,7 @@ python batch_run.py -s <input_dir> --output_dir <output_dir>
 - 解析后的 `input_root` 不存在或不是目录；
 - `--datasets` 指定项不存在、不是一级目录，或在绝对模式下不以 `QP` 开头；
 - `--sub_dir` 为空、包含路径分隔符、为 `.`/`..` 或是绝对路径。`sub_dir` 必须只是单个日期目录名，防止它改变固定路径结构。
+- 数据集名称看起来携带帧字段但值不是正整数，例如 `_0-2026-...`、`_-2026-...` 或 `_abc-2026-...`。
 
 运行前日志至少打印：
 
@@ -317,6 +393,12 @@ Will process N dataset(s).
 ```
 
 每个数据集继续打印完整输入目录和完整输出目录，方便确认中文共享盘路径是否正确。
+
+匹配目录名帧参数时还应打印：
+
+```text
+Dataset frame metadata: encoded=75; effective pre_frame_count=75, start_frame=1, freeze_frame=75
+```
 
 ## 7. 测试计划
 
@@ -352,6 +434,20 @@ Will process N dataset(s).
 - 拒绝 `--sub_dir ../0717`、`Y:/0717`、空字符串和包含 `/` 或 `\\` 的值。
 - 中文路径与正斜杠/正确转义的反斜杠写法都能得到相同路径。
 - 显式 `-s`、显式 `--output_dir` 的既有测试继续通过。
+
+### 数据集名称帧参数
+
+- `QPA_75-2026-07-19-103215` 解析为 `75`，并为该数据集设置 `pre_frame_count=75`、`start_frame=1`、`freeze_frame=75`。
+- `QPA_125-2026-07-19-103215` 同理解析为 `125`。
+- `QPA-2026-07-19-103215` 不触发覆盖，完整保留原参数来源和优先级。
+- 不把时间戳中的 `2026`、`07` 等数字误识别为帧数。
+- `_0-`、负数、空字段和非数字字段给出包含目录名的清晰错误。
+- 同一批次处理 `QPA_75-...`、普通 `QPA-...` 和 `QPB_125-...` 时，各自参数互不污染。
+- 输出仍为 `风暴时刻输出/QPA_75-.../QPA_75-....mp4`，完整保留 `_75`。
+- 未显式传入相关参数时，目录元数据优先于 JSON 和默认值，并保证 `freeze_frame == pre_frame_count`。
+- `QPG_86-... --pre-frame-count 75 --start_frame 1 --freeze_frame 75` 的最终有效值为 `75/1/75`。
+- 只显式传入 `--pre-frame-count 75` 或 `--freeze_frame 75` 时，另一个关联字段也使用 `75`。
+- 同时显式传入不同的 `--pre-frame-count` 与 `--freeze_frame` 时明确报错。
 
 测试命令：
 

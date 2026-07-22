@@ -39,12 +39,21 @@ SpacetimeSlicer：前 75 帧全部作为特效段、无片头、90 机位环绕�
 将 0719 替换成实际日期目录，调用示例如下：
 
     uv run python batch_run.py `
-      --sub_dir 0719 `
+      --sub_dir 0722 `
       --pre-frame-count 75 `
       --start_frame 1 `
       --freeze_frame 75 `
+      --dataset QPB_75-2026-07-22-085332 `
       --initial_subject_patch_mode frame `
-      --initial_subject_patch_frame xx `
+      --initial_subject_patch_frame 99`
+      --force
+      
+    uv run python batch_run.py `
+      --sub_dir 0722 `
+      --pre-frame-count 75 `
+      --start_frame 1 `
+      --freeze_frame 75 `
+      --dataset QPG_88-2026-07-22-092745 `
       --force
 
 当前 configs/spacetime_slicer.json 中 end_frame 必须保持：
