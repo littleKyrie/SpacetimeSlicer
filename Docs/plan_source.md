@@ -1,12 +1,44 @@
 # `source` 模式逐帧跟踪与残影回收修改方案
 
+## 0. 本轮修订：真实人物始终位于残影之上
+
+在逐帧跟踪与密集回收轨迹已经建立的基础上，`source` 的可见合成进一步满足：
+
+1. 完整原始帧始终作为输出基础，当前人物 RGB 不由 RVM 抠图重建。
+2. 当前帧 RVM Alpha 只用于构造“真实人物保护遮罩”，限制历史残影可以覆盖的区域。
+3. 历史残影与当前人物重叠时，只取消重叠位置的残影 Alpha，直接保留原始帧像素。
+4. 新残影在捕获瞬间若与当前人物重合，会被当前人物遮住；人物移动后，留在原位置的残影才显露。
+5. 回收使用 freeze 帧保护遮罩，残影汇聚到最终人物时进入人物后方，不覆盖最终人物。
+6. `patched_canvas` 保持原有行为。
+
+目标层级为：
+
+```text
+当前原始帧人物
+历史永久残影
+当前原始帧背景
+```
+
+由于原始帧同时包含人物和背景，不能简单把整张原始帧最后覆盖到画布上，也不能只反转残影循环顺序。实现时对每个残影计算：
+
+```python
+live_protection = alpha_mask > live_subject_alpha_threshold
+effective_ghost_alpha = (
+    ghost_alpha
+    * ghost_opacity
+    * (1.0 - live_protection)
+)
+```
+
+新增 `live_subject_protect_dilate` 参数，对二值保护遮罩做可配置膨胀，覆盖 RVM 人物边缘的低置信度像素。保护遮罩只裁减残影 Alpha，不修改原始帧 RGB，因此分割边缘不会直接造成当前人物残缺或背景替换黑边。
+
 ## 1. 目标
 
 修改 `effect_base_mode=source` 的内部逻辑，使切片生成、正常画面输出和残影回收相互解耦：
 
 1. 从 `start_frame` 到回收目标帧连续运行分割策略，RVM 的递归状态按连续视频帧更新。
 2. 只有满足 `ghost_interval` 的帧创建可见的永久残影，并使用对应的 `ghost_opacity`。
-3. 非切片帧始终保留完整原始视频帧，不使用该帧 Alpha 重建当前人物，因此非切片帧的 RVM 漏分、错分不得直接造成正常人物残缺。
+3. 非切片帧始终保留完整原始视频帧，不使用该帧 Alpha 重建当前人物；该帧 Alpha 只限制历史残影的覆盖范围。
 4. 每一帧的原图和 Alpha 作为隐藏轨迹样本保留，供回收阶段把永久残影平滑移动到凝结姿态。
 5. 回收完成后再进入现有多机位冻结环绕流程。
 
@@ -17,7 +49,7 @@
 - `source` 模式以原始视频帧作为正常画面底图的行为；
 - `patched_canvas` 的当前可见合成效果；
 - RIFE 插帧、冻结环绕和片尾播放逻辑；
-- 现有命令行和 JSON 配置字段。
+- 除新增人物保护遮罩膨胀参数外的现有命令行和 JSON 配置字段。
 
 ## 2. 当前实现与缺口
 
@@ -103,7 +135,7 @@ permanent_indices.append(sample_idx)
 
 ### 3.3 `source` 模式的正常画面
 
-输出帧仍按现有方式生成：
+输出帧以完整原始帧为基础，并使用当前帧 Alpha 保护真实人物：
 
 ```python
 base_frame = current_frame
@@ -111,21 +143,24 @@ frame_output = compose_static_ghosts(
     base_frame,
     all_ghosts,
     permanent_indices,
+    live_subject_alpha=alpha_mask,
+    live_subject_alpha_threshold=live_subject_alpha_threshold,
+    live_subject_protect_dilate=live_subject_protect_dilate,
 )
 ```
 
 `compose_static_ghosts()` 只遍历 `permanent_indices`，因此：
 
 - 当前帧完整保留；
-- 非切片帧的 Alpha 即使残缺或误判，也不会直接参与当前画面；
+- 非切片帧的 Alpha 不重建当前人物，只用来裁减与当前人物重叠的残影 Alpha；
 - 已创建的永久残影继续按各自 Alpha 和 `ghost_opacity` 叠加；
 - 非永久的密集轨迹样本不会在前期显示。
 
-起始帧的 `initial_subject_replacement` 行为保持现状：仅在起始帧底图中修补初始人物区域，再叠加第一张切片。该行为需要保留现有测试，避免本次修改意外改变第一帧视觉效果。
+`source` 起始帧不再应用 `initial_subject_replacement`，而是保留完整原始人物。第一张切片与当前人物重合的部分由保护遮罩挡住，人物移动后残影才显露。`initial_subject_replacement` 继续服务于 `patched_canvas`，避免 source 首帧被修补为空背景。
 
 ### 3.4 回收阶段
 
-回收阶段继续使用现有结构：
+回收阶段继续使用现有轨迹结构，并在 `background_mode=freeze` 时使用 freeze 帧 Alpha 保护最终人物：
 
 ```text
 永久残影索引 p_idx
@@ -137,6 +172,8 @@ build_recovery_trajectories()
 interpolate_ghost() 在相邻逐帧样本间插值
         ↓
 compose_recovery_frame() 按永久残影原 opacity 合成
+        ↓
+使用 freeze 人物保护遮罩裁减重叠位置的残影 Alpha
 ```
 
 修改后 `last_ghost_idx = len(all_ghosts) - 1` 对应跟踪范围的最后一帧，而不是最后一次 `ghost_interval` 命中帧。这样每个永久残影都会沿真实逐帧主体轨迹回到最终凝结姿态。
@@ -253,17 +290,17 @@ should_be_ghost = (
 
 永久残影透明度仍使用现有线性序列，数量仍按输出切片范围计算，不能把隐藏跟踪帧计入 `num_ghosts_expected`。
 
-### 步骤 4：保持 `source` 可见输出不使用当前帧 Alpha
+### 步骤 4：`source` 使用当前帧 Alpha 限制残影覆盖区域
 
 只有 `is_output_frame` 才执行：
 
-- 起始帧底图修补；
+- 当前帧人物保护遮罩；
 - `compose_static_ghosts()`；
 - `stage_writer.write()`；
 - `last_effect_frame` 更新；
 - 渲染进度输出。
 
-在 `source` 分支中禁止使用当前帧 `alpha_mask` 构造 live mask。Alpha 只能通过永久残影叠加间接出现在画面中。
+在 `source` 分支中使用当前帧 `alpha_mask` 构造保护遮罩，但不使用该遮罩提取或重建当前人物。保护遮罩只参与 `effective_ghost_alpha` 的计算，遮罩内的输出像素保持为原始帧。
 
 ### 步骤 5：保持 `patched_canvas` 行为
 
@@ -316,7 +353,7 @@ tracking_end_idx = 上述结果
 
 ```text
 source：每帧运行分割并保存回收轨迹；正常画面使用完整原始帧；
-只有 ghost_interval 命中帧创建可见残影。
+只有 ghost_interval 命中帧创建可见残影；当前帧 Alpha 只阻止残影覆盖真实人物。
 ```
 
 同时说明代价：
@@ -325,7 +362,7 @@ source：每帧运行分割并保存回收轨迹；正常画面使用完整原�
 - `all_ghosts` 会保存逐帧 BGR 和 Alpha，显存占用主要仍由模型决定，但系统内存占用会上升到接近 `patched_canvas`；
 - 好处是切片帧获得连续 RVM 状态，回收轨迹也更贴近真实动作。
 
-本次不新增 JSON 字段，`configs/spacetime_slicer.json` 和批处理参数转发无需结构性修改。
+新增 `live_subject_protect_dilate` JSON/CLI 字段，默认值为 `2`。批处理继续通过现有未知参数转发机制传递该字段，无需增加专用批处理分支。
 
 ## 8. 测试方案
 
@@ -345,11 +382,11 @@ test_segment_only_runs_segmentation_on_slice_frames
 - 三帧输入的调用索引为 `[0, 1, 2]`；
 - `all_ghosts` 长度为 `3`；
 - `ghost_interval=2` 时 `permanent_indices == [0, 2]`；
-- 原有输出像素 `[10, 15, 25]` 保持不变。
+- 当前人物保护区内输出像素保持为原始帧。
 
-这同时证明“推理次数改变，但可见合成不改变”。
+这同时证明“逐帧推理用于遮挡保护和回收，但不重建当前人物”。
 
-### 8.2 非切片 Alpha 不污染正常画面
+### 8.2 非切片 Alpha 不重建当前人物
 
 增加逐帧返回不同 Alpha 的假策略：
 
@@ -358,7 +395,17 @@ test_segment_only_runs_segmentation_on_slice_frames
 - 验证非切片输出仍以完整原始帧为底；
 - 验证只有 `permanent_indices` 指向的 Alpha 被 `compose_static_ghosts()` 显示。
 
-### 8.3 密集样本用于回收
+### 8.3 当前真实人物始终位于残影之上
+
+构造历史残影与当前人物部分重叠的二维测试帧，验证：
+
+- 人物保护区内输出像素与当前原始帧逐像素一致；
+- 保护区之外的历史残影仍按原 opacity 显示；
+- 新残影捕获瞬间与当前人物重合的区域不可见；
+- 当前人物离开后，该永久残影重新显露；
+- 调高 `live_subject_protect_dilate` 会扩大保护范围，但不修改原始帧 RGB。
+
+### 8.4 密集样本用于回收
 
 构造人物位置逐帧移动的四帧 Alpha：
 
@@ -367,7 +414,7 @@ test_segment_only_runs_segmentation_on_slice_frames
 - 确认 `last_ghost_idx` 指向该最后一帧；
 - 确认回收最终帧中的永久残影到达最后一帧人物中心，而不是停在最后一次切片位置。
 
-### 8.4 `before_freeze` 隐藏跟踪
+### 8.5 `before_freeze` 隐藏跟踪
 
 覆盖以下断言：
 
@@ -379,7 +426,14 @@ test_segment_only_runs_segmentation_on_slice_frames
 - `last_effect_frame` 仍是最后一个可见切片生成输出；
 - 回收终点对应 `freeze_idx`。
 
-### 8.5 回归测试
+### 8.6 回收阶段保护 freeze 人物
+
+- `background_mode=freeze` 时把最终密集样本 Alpha 传入回收合成；
+- 回收残影在 freeze 人物保护区内不得覆盖背景原始像素；
+- 保护区以外仍保留既有回收轨迹、插值和 opacity；
+- `patched_canvas` 与未传保护遮罩的直接调用保持原有结果。
+
+### 8.7 回归测试
 
 保留并运行现有测试：
 
@@ -395,8 +449,8 @@ test_segment_only_runs_segmentation_on_slice_frames
 建议执行：
 
 ```powershell
-python -m unittest test.test_spacetime_slicer
-python -m unittest test.test_batch_run
+python -m unittest discover -s test -p "test_spacetime_slicer.py"
+python -m unittest discover -s test -p "test_batch_run.py"
 ```
 
 如测试环境已配置完整依赖，再执行：
@@ -411,12 +465,13 @@ python -m unittest discover -s test
 
 1. `source` 在跟踪范围逐帧调用 RVM，调用顺序连续且包含最终回收目标帧。
 2. 只有 `ghost_interval` 命中帧进入 `permanent_indices`。
-3. 非切片帧 Alpha 无论全零、残缺还是误判，都不直接改变该帧原始人物。
-4. 切片生成阶段可见残影数量、捕获帧位置和透明度与修改前一致。
-5. 回收阶段使用逐帧隐藏样本，并最终汇聚到 `freeze_frame` 人物姿态。
-6. `before_freeze` 的隐藏跟踪帧不被额外写入输出视频。
-7. `patched_canvas` 的现有输出保持不变。
-8. 现有测试通过，新增 source 逐帧跟踪、画面隔离和回收终点测试通过。
+3. 非切片帧 Alpha 不重建该帧原始人物，只限制历史残影覆盖区域。
+4. 人物保护区内的输出像素与原始帧一致，保护区外的永久残影正常显示。
+5. 切片生成阶段可见残影数量、捕获帧位置和透明度与修改前一致。
+6. 回收阶段使用逐帧隐藏样本，并最终汇聚到 `freeze_frame` 人物姿态，且不覆盖 freeze 人物。
+7. `before_freeze` 的隐藏跟踪帧不被额外写入输出视频。
+8. `patched_canvas` 的现有输出保持不变。
+9. 现有测试通过，新增 source 人物顶层、保护膨胀和回收保护测试通过。
 
 ## 10. 风险与控制
 
@@ -437,7 +492,7 @@ python -m unittest discover -s test
 
 ### 分割异常对回收的影响
 
-新逻辑能保证非切片 Alpha 不污染正常画面，但逐帧 Alpha 仍会影响回收轨迹。如果某个中间样本严重漏分或误分，回收过程中仍可能短暂出现形状异常。第一版继续沿用现有最大连通域、质心和相邻帧插值策略；后续可独立增加：
+新逻辑能保证非切片 Alpha 不裁切或重建当前人物，但它会影响历史残影的遮挡范围和回收轨迹。漏分可能让残影穿透当前人物，误分可能让部分残影在背景区域被隐藏；某个中间样本严重异常时，回收过程中仍可能短暂出现形状异常。第一版通过阈值和可配置膨胀控制人物保护范围，并继续沿用现有最大连通域、质心和相邻帧插值策略；后续可独立增加：
 
 - 面积突变检测；
 - 质心速度异常检测；
@@ -451,9 +506,11 @@ python -m unittest discover -s test
 1. 在 `process_segment()` 中加入输出范围/跟踪范围分离。
 2. 将 `source` 改为逐帧分割并统一保存轨迹样本。
 3. 保证只有输出范围内的 `ghost_interval` 帧登记为永久残影。
-4. 保持 `source` 输出使用原始帧加永久残影。
-5. 在 `generate()` 中让 `source` 跟踪到 `freeze_idx`。
-6. 更新和补充单元测试。
-7. 运行针对性测试与完整测试。
-8. 更新 CLI help 和 README。
-9. 使用实际视频重点检查非切片帧、最后一个非切片帧、回收起点、回收终点和冻结环绕衔接。
+4. 修改 `source` 静态合成，使当前帧 Alpha 只裁减与真实人物重叠的残影。
+5. source 首帧保留完整原始人物，不再应用起始人物背景修补。
+6. 在 `generate()` 中让 `source` 跟踪到 `freeze_idx`，并把 freeze Alpha 作为回收保护遮罩。
+7. 新增可配置的保护遮罩膨胀参数。
+8. 更新和补充单元测试。
+9. 运行针对性测试与完整测试。
+10. 更新 CLI help 和 README。
+11. 使用实际视频重点检查残影与真实人物交叠帧、最后一个非切片帧、回收起点、回收终点和冻结环绕衔接。

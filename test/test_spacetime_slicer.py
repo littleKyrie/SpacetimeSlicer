@@ -28,6 +28,16 @@ class ConstantAlphaStrategy:
         return self.alpha.copy()
 
 
+class SequenceAlphaStrategy:
+    def __init__(self, alphas):
+        self.alphas = alphas
+        self.calls = []
+
+    def process_frame(self, current_frame, current_idx):
+        self.calls.append(current_idx)
+        return self.alphas[current_idx].copy()
+
+
 class FakeRifeInterpolator:
     def __init__(self):
         self.calls = []
@@ -278,28 +288,37 @@ class SpacetimeSlicerTest(unittest.TestCase):
         self.assertEqual(parse_frame_ids('115:117'), [115, 116, 117])
         self.assertEqual(parse_frame_ids('115,130'), [115, 130])
 
-    def test_segment_blends_ghost_with_effective_alpha(self):
+    def test_source_clips_ghost_alpha_where_current_subject_is_present(self):
         frames = [
-            np.full((1, 1, 3), 100, dtype=np.uint8),
-            np.full((1, 1, 3), 200, dtype=np.uint8),
+            np.full((1, 2, 3), 100, dtype=np.uint8),
+            np.full((1, 2, 3), 200, dtype=np.uint8),
+        ]
+        first_alpha = np.zeros((1, 2), dtype=np.uint8)
+        first_alpha[0, 0] = 255
+        second_alpha = np.zeros((1, 2), dtype=np.uint8)
+        second_alpha[0, 1] = 255
+        alphas = [
+            first_alpha,
+            second_alpha,
         ]
         slicer = make_slicer(frames)
         all_ghosts = []
         permanent_indices = []
 
         ghost_count, last_effect_frame = slicer.process_segment(
-            ConstantAlphaStrategy(np.full((1, 1), 255, dtype=np.uint8)),
-            0, 0, 2, 1, 0, all_ghosts, permanent_indices, FrameCollector(),
+            SequenceAlphaStrategy(alphas),
+            0, 0, 2, 2, 0, all_ghosts, permanent_indices, FrameCollector(),
             ghost_opacity_start=0.25,
             ghost_opacity_end=0.25,
             effect_base_mode='source',
+            live_subject_protect_dilate=0,
         )
 
-        self.assertEqual(ghost_count, 2)
-        self.assertEqual(permanent_indices, [0, 1])
-        self.assertTrue(np.array_equal(last_effect_frame, np.full((1, 1, 3), 181, dtype=np.uint8)))
+        self.assertEqual(ghost_count, 1)
+        self.assertEqual(permanent_indices, [0])
+        self.assertEqual(last_effect_frame[0, :, 0].tolist(), [175, 200])
 
-    def test_segment_only_runs_segmentation_on_slice_frames(self):
+    def test_source_runs_segmentation_on_every_frame_but_only_keeps_slice_frames(self):
         frames = [
             np.full((1, 1, 3), 10, dtype=np.uint8),
             np.full((1, 1, 3), 20, dtype=np.uint8),
@@ -308,17 +327,113 @@ class SpacetimeSlicerTest(unittest.TestCase):
         slicer = make_slicer(frames)
         strategy = ConstantAlphaStrategy(np.full((1, 1), 255, dtype=np.uint8))
         out = FrameCollector()
+        all_ghosts = []
+        permanent_indices = []
 
         slicer.process_segment(
             strategy,
-            0, 0, 3, 2, 0, [], [], out,
+            0, 0, 3, 2, 0, all_ghosts, permanent_indices, out,
             ghost_opacity_start=0.5,
             ghost_opacity_end=0.5,
             effect_base_mode='source',
         )
 
-        self.assertEqual(strategy.calls, [0, 2])
-        self.assertEqual([int(frame[0, 0, 0]) for frame in out.frames], [10, 15, 25])
+        self.assertEqual(strategy.calls, [0, 1, 2])
+        self.assertEqual(len(all_ghosts), 3)
+        self.assertEqual(permanent_indices, [0, 2])
+        self.assertEqual([int(frame[0, 0, 0]) for frame in out.frames], [10, 20, 30])
+
+    def test_source_non_slice_alpha_does_not_replace_original_frame(self):
+        frames = [
+            np.full((1, 1, 3), 100, dtype=np.uint8),
+            np.full((1, 1, 3), 200, dtype=np.uint8),
+            np.full((1, 1, 3), 220, dtype=np.uint8),
+        ]
+        alphas = [
+            np.zeros((1, 1), dtype=np.uint8),
+            np.full((1, 1), 255, dtype=np.uint8),
+            np.zeros((1, 1), dtype=np.uint8),
+        ]
+        slicer = make_slicer(frames)
+        out = FrameCollector()
+
+        slicer.process_segment(
+            SequenceAlphaStrategy(alphas),
+            0, 0, 3, 2, 0, [], [], out,
+            ghost_opacity_start=1.0,
+            ghost_opacity_end=1.0,
+            effect_base_mode='source',
+        )
+
+        self.assertEqual(
+            [int(frame[0, 0, 0]) for frame in out.frames],
+            [100, 200, 220],
+        )
+
+    def test_source_dense_samples_move_recovery_to_final_non_slice_frame(self):
+        frames = [
+            np.full((1, 5, 3), value, dtype=np.uint8)
+            for value in (80, 120, 160, 200)
+        ]
+        alphas = []
+        for position in range(4):
+            alpha = np.zeros((1, 5), dtype=np.uint8)
+            alpha[0, position] = 255
+            alphas.append(alpha)
+
+        slicer = make_slicer(frames)
+        all_ghosts = []
+        permanent_indices = []
+        slicer.process_segment(
+            SequenceAlphaStrategy(alphas),
+            0, 0, 4, 2, 0, all_ghosts, permanent_indices, FrameCollector(),
+            ghost_opacity_start=1.0,
+            ghost_opacity_end=1.0,
+            effect_base_mode='source',
+        )
+
+        self.assertEqual(len(all_ghosts), 4)
+        self.assertEqual(permanent_indices, [0, 2])
+
+        recovery_out = FrameCollector()
+        slicer.process_fade_out(
+            recovery_out,
+            all_ghosts,
+            permanent_indices,
+            np.zeros((1, 5, 3), dtype=np.uint8),
+            total_fade_frames=3,
+        )
+
+        self.assertEqual(
+            recovery_out.frames[-1][0, :, 0].tolist(),
+            [0, 0, 0, 200, 0],
+        )
+
+    def test_source_tracks_hidden_frames_without_writing_or_capturing_them(self):
+        frames = [
+            np.full((1, 1, 3), value, dtype=np.uint8)
+            for value in (10, 20, 30, 40)
+        ]
+        slicer = make_slicer(frames)
+        strategy = ConstantAlphaStrategy(np.full((1, 1), 255, dtype=np.uint8))
+        out = FrameCollector()
+        all_ghosts = []
+        permanent_indices = []
+
+        _, last_effect_frame = slicer.process_segment(
+            strategy,
+            0, 0, 2, 1, 0, all_ghosts, permanent_indices, out,
+            ghost_opacity_start=0.0,
+            ghost_opacity_end=0.0,
+            effect_base_mode='source',
+            tracking_end_idx=4,
+        )
+
+        self.assertEqual(strategy.calls, [0, 1, 2, 3])
+        self.assertEqual(len(all_ghosts), 4)
+        self.assertEqual(permanent_indices, [0, 1])
+        self.assertEqual([int(frame[0, 0, 0]) for frame in out.frames], [10, 20])
+        self.assertEqual(int(last_effect_frame[0, 0, 0]), 20)
 
     def test_patched_canvas_runs_segmentation_on_every_frame(self):
         frames = [
@@ -356,7 +471,7 @@ class SpacetimeSlicerTest(unittest.TestCase):
 
         self.assertEqual([int(frame[0, 0, 0]) for frame in out.frames], [100, 200])
 
-    def test_initial_patch_only_replaces_start_frame_base_before_first_slice(self):
+    def test_source_ignores_initial_patch_and_keeps_original_start_subject(self):
         frames = [
             np.full((1, 1, 3), 100, dtype=np.uint8),
             np.full((1, 1, 3), 200, dtype=np.uint8),
@@ -373,7 +488,38 @@ class SpacetimeSlicerTest(unittest.TestCase):
             effect_base_mode='source',
         )
 
-        self.assertEqual([int(frame[0, 0, 0]) for frame in out.frames], [25, 175])
+        self.assertEqual([int(frame[0, 0, 0]) for frame in out.frames], [100, 200])
+
+    def test_source_subject_protection_dilation_expands_the_no_ghost_region(self):
+        slicer = SpacetimeSlicer.__new__(SpacetimeSlicer)
+        background = np.full((1, 3, 3), 200, dtype=np.uint8)
+        ghost_alpha = np.zeros((1, 3), dtype=np.uint8)
+        ghost_alpha[0, 0] = 255
+        live_alpha = np.zeros((1, 3), dtype=np.uint8)
+        live_alpha[0, 1] = 255
+        all_ghosts = [{
+            'frame': np.full((1, 3, 3), 100, dtype=np.uint8),
+            'alpha': ghost_alpha,
+            'opacity': 1.0,
+        }]
+
+        without_dilation = slicer.compose_static_ghosts(
+            background,
+            all_ghosts,
+            [0],
+            live_subject_alpha=live_alpha,
+            live_subject_protect_dilate=0,
+        )
+        with_dilation = slicer.compose_static_ghosts(
+            background,
+            all_ghosts,
+            [0],
+            live_subject_alpha=live_alpha,
+            live_subject_protect_dilate=1,
+        )
+
+        self.assertEqual(without_dilation[0, :, 0].tolist(), [100, 200, 200])
+        self.assertEqual(with_dilation[0, :, 0].tolist(), [200, 200, 200])
 
     def test_manual_patch_frame_defaults_to_freeze_frame(self):
         frames = [
@@ -432,6 +578,40 @@ class SpacetimeSlicerTest(unittest.TestCase):
         slicer.process_fade_out(out, all_ghosts, [0], np.zeros((1, 1, 3), dtype=np.uint8), 3)
 
         self.assertEqual([int(frame[0, 0, 0]) for frame in out.frames], [25, 50, 60])
+
+    def test_recovery_subject_protection_keeps_freeze_person_above_ghosts(self):
+        slicer = SpacetimeSlicer.__new__(SpacetimeSlicer)
+        first_alpha = np.zeros((1, 3), dtype=np.uint8)
+        first_alpha[0, 0] = 255
+        freeze_alpha = np.zeros((1, 3), dtype=np.uint8)
+        freeze_alpha[0, 1] = 255
+        all_ghosts = [
+            {
+                'frame': np.full((1, 3, 3), 100, dtype=np.uint8),
+                'alpha': first_alpha,
+                'opacity': 1.0,
+            },
+            {
+                'frame': np.full((1, 3, 3), 50, dtype=np.uint8),
+                'alpha': freeze_alpha,
+                'opacity': 1.0,
+            },
+        ]
+        background = np.full((1, 3, 3), 200, dtype=np.uint8)
+        out = FrameCollector()
+
+        slicer.process_fade_out(
+            out,
+            all_ghosts,
+            [0],
+            background,
+            total_fade_frames=2,
+            subject_protection_alpha=freeze_alpha,
+            live_subject_protect_dilate=0,
+        )
+
+        self.assertEqual(out.frames[0][0, :, 0].tolist(), [100, 200, 200])
+        self.assertEqual(out.frames[-1][0, :, 0].tolist(), [200, 200, 200])
 
     def test_recovery_cutout_aligns_subject_before_blending(self):
         slicer = SpacetimeSlicer.__new__(SpacetimeSlicer)

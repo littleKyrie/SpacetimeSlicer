@@ -315,22 +315,39 @@ def build_parser():
         type=int,
         default=16,
         help=(
-            'Alpha threshold (0-255) that serves two related purposes in '
-            'patched_canvas mode: '
-            '(1) Live-subject mask — pixels with alpha above this value are '
-            'rendered as the current-frame person, covering the canvas. '
-            '(2) Ghost-burn filter — only pixels with alpha above this value '
-            'are burned into the persistent canvas during ghost frames, '
+            'Alpha threshold (0-255) used by both effect modes. In source '
+            'mode it creates a protection mask that prevents permanent '
+            'ghosts from covering the current person while keeping the '
+            'complete original frame. In patched_canvas mode it serves two '
+            'related purposes: (1) Live-subject mask — pixels with alpha '
+            'above this value are rendered as the current-frame person, '
+            'covering the canvas. (2) Ghost-burn filter — only pixels with '
+            'alpha above this value are burned into the persistent canvas, '
             'preventing low-confidence edge noise from accumulating. '
-            'Using one threshold for both keeps the burned-canvas footprint '
-            'and the live-subject mask spatially aligned, avoiding edge '
-            'fringing around the subject. Adjust upward if you see semi-'
-            'transparent halos at body edges; downward if ghost silhouettes '
-            'are clipped too aggressively.'
+            'Adjust downward if ghosts bleed through the current subject.'
+        ),
+    )
+    parser.add_argument(
+        '--live_subject_protect_dilate',
+        type=int,
+        default=2,
+        help=(
+            'Dilate the source-mode current-subject protection mask by this '
+            'many 3x3 iterations before clipping overlapping ghost alpha. '
+            'Also applies to the freeze-subject mask during source recovery.'
         ),
     )
     parser.add_argument('--live_subject_opacity', type=float, default=1.0, help='Opacity of the current live subject in patched_canvas mode')
-    parser.add_argument('--effect_base_mode', default='patched_canvas', choices=['patched_canvas', 'source'], help='patched_canvas mattes the current subject every frame; source uses each original frame as the base and only mattes slice frames')
+    parser.add_argument(
+        '--effect_base_mode',
+        default='patched_canvas',
+        choices=['patched_canvas', 'source'],
+        help=(
+            'patched_canvas mattes the current subject over a persistent canvas; '
+            'source keeps each original frame as the visible base, tracks the '
+            'subject on every frame for recovery, and only displays interval slices'
+        ),
+    )
     parser.add_argument('--debug_extract_frames', help='Write RVM alpha/cutout diagnostics for comma-separated frames or an inclusive range, then exit')
     parser.add_argument('--debug_extract_camera', type=int, help='Camera ID for --debug_extract_frames; defaults to the first --camera_ids entry')
     parser.add_argument('--stretch_head', type=int, default=1)
@@ -464,6 +481,7 @@ def main(argv=None):
             effect_base_mode=args.effect_base_mode,
             live_subject_opacity=args.live_subject_opacity,
             live_subject_alpha_threshold=args.live_subject_alpha_threshold,
+            live_subject_protect_dilate=args.live_subject_protect_dilate,
             centroid_mask=args.centroid_mask,
             ffmpeg_executable=args.ffmpeg_exe,
             h264_crf=args.h264_crf,

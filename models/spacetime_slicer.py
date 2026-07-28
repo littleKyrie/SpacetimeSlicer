@@ -363,10 +363,18 @@ class SpacetimeSlicer:
                         initial_patch_dilate=1,
                         effect_base_mode='patched_canvas',
                         live_subject_opacity=1.0,
-                        live_subject_alpha_threshold=16):
-        """Generate the slice segment using either source-frame or patched-canvas compositing."""
+                        live_subject_alpha_threshold=16,
+                        live_subject_protect_dilate=2,
+                        tracking_end_idx=None):
+        """Generate visible slice frames and retain dense subject samples for recovery."""
         if effect_base_mode not in ('source', 'patched_canvas'):
             raise ValueError(f"Unknown effect base mode: {effect_base_mode}")
+        if tracking_end_idx is None:
+            tracking_end_idx = end_idx
+        if tracking_end_idx < end_idx:
+            raise ValueError("tracking_end_idx must not be earlier than end_idx")
+        if live_subject_protect_dilate < 0:
+            raise ValueError("live_subject_protect_dilate must not be negative")
 
         num_ghosts_expected = max(1, ((end_idx - 1 - start_idx) // ghost_interval) + 1)
         ghost_opacities = np.linspace(ghost_opacity_start, ghost_opacity_end, num_ghosts_expected)
@@ -380,20 +388,24 @@ class SpacetimeSlicer:
         stage_writer = self.create_rife_writer(out, stretch_ghost, start_idx, end_idx - 1)
         last_frame_output = None
 
-        for i in range(start_idx, end_idx):
+        for i in range(start_idx, tracking_end_idx):
             current_frame = self.read_frame(i, camera_id)
             base_frame = current_frame
-            should_be_ghost = ((i - start_idx) % ghost_interval == 0)
-            needs_alpha = should_be_ghost or effect_base_mode == 'patched_canvas'
-            alpha_mask = None
-            if needs_alpha:
-                alpha_mask = strategy.process_frame(current_frame, i)
+            is_output_frame = i < end_idx
+            should_be_ghost = (
+                is_output_frame and (i - start_idx) % ghost_interval == 0
+            )
+            alpha_mask = strategy.process_frame(current_frame, i)
 
-                if edge_feather < 0:
-                    kernel = np.ones((3, 3), np.uint8)
-                    alpha_mask = cv2.erode(alpha_mask, kernel, iterations=abs(edge_feather))
+            if edge_feather < 0:
+                kernel = np.ones((3, 3), np.uint8)
+                alpha_mask = cv2.erode(alpha_mask, kernel, iterations=abs(edge_feather))
 
-            if i == start_idx and initial_subject_replacement is not None and alpha_mask is not None:
+            if (
+                i == start_idx
+                and initial_subject_replacement is not None
+                and effect_base_mode == 'patched_canvas'
+            ):
                 patched_start_frame = self.patch_initial_subject_region(
                     current_frame,
                     initial_subject_replacement,
@@ -402,11 +414,12 @@ class SpacetimeSlicer:
                     dilate_iterations=initial_patch_dilate,
                 )
                 base_frame = patched_start_frame
-                if effect_base_mode == 'patched_canvas':
-                    canvas_ghosts = patched_start_frame.copy()
+                canvas_ghosts = patched_start_frame.copy()
 
+            sample_opacity = 1.0
             if should_be_ghost:
                 g_opacity = ghost_opacities[min(ghost_count, len(ghost_opacities) - 1)]
+                sample_opacity = g_opacity
                 if effect_base_mode == 'patched_canvas':
                     # ---- Ghost burn into the persistent canvas ----
                     #
@@ -435,17 +448,28 @@ class SpacetimeSlicer:
                         canvas_ghosts * (1 - ghost_alpha)
                     ).astype(np.uint8)
 
-                permanent_indices.append(len(all_ghosts))
-                all_ghosts.append({
-                    'frame': current_frame.copy(),
-                    'alpha': alpha_mask.copy(),
-                    'opacity': g_opacity,
-                })
+            sample_idx = len(all_ghosts)
+            all_ghosts.append({
+                'frame': current_frame.copy(),
+                'alpha': alpha_mask.copy(),
+                'opacity': sample_opacity,
+            })
+
+            if should_be_ghost:
+                permanent_indices.append(sample_idx)
                 ghost_count += 1
+
+            if not is_output_frame:
+                continue
 
             if effect_base_mode == 'source':
                 frame_output = self.compose_static_ghosts(
-                    base_frame, all_ghosts, permanent_indices
+                    base_frame,
+                    all_ghosts,
+                    permanent_indices,
+                    live_subject_alpha=alpha_mask,
+                    live_subject_alpha_threshold=live_subject_alpha_threshold,
+                    live_subject_protect_dilate=live_subject_protect_dilate,
                 )
             else:
                 # ---- Live-subject compositing over the canvas ----
@@ -465,13 +489,6 @@ class SpacetimeSlicer:
             last_frame_output = frame_output
 
             stage_writer.write(frame_output, i)
-
-            if effect_base_mode == 'patched_canvas' and not should_be_ghost:
-                all_ghosts.append({
-                    'frame': current_frame.copy(),
-                    'alpha': alpha_mask.copy(),
-                    'opacity': 1.0,
-                })
 
             print(f"  > 机位 {camera_id} 渲染特效帧: {i}/{end_idx-1} (已累积 {ghost_count} 个残影)", end='\r')
 
@@ -567,8 +584,25 @@ class SpacetimeSlicer:
             trajectories[p_idx] = positions
         return trajectories
 
+    def build_subject_protection_mask(self, alpha_mask, alpha_threshold,
+                                      dilate_iterations=0):
+        if alpha_mask is None:
+            return None
+        if dilate_iterations < 0:
+            raise ValueError("dilate_iterations must not be negative")
+
+        protection_mask = (alpha_mask > alpha_threshold).astype(np.uint8)
+        if dilate_iterations > 0:
+            kernel = np.ones((3, 3), np.uint8)
+            protection_mask = cv2.dilate(
+                protection_mask,
+                kernel,
+                iterations=dilate_iterations,
+            )
+        return protection_mask.astype(np.float32)
+
     def compose_recovery_frame(self, all_ghosts, permanent_indices, ghost_trajectories, background,
-                               frame_offset):
+                               frame_offset, subject_protection=None):
         current_canvas = background.copy()
         for p_idx in permanent_indices:
             trajectory = ghost_trajectories.get(p_idx)
@@ -576,22 +610,32 @@ class SpacetimeSlicer:
                 continue
             ghost = self.interpolate_ghost(all_ghosts, trajectory[frame_offset])
             ghost_opacity = all_ghosts[p_idx].get('opacity', 1.0)
-            ghost_alpha_3ch = np.repeat(
-                ghost['alpha'][:, :, np.newaxis], 3, axis=2
-            ) / 255.0 * ghost_opacity
+            ghost_alpha = ghost['alpha'].astype(np.float32) / 255.0 * ghost_opacity
+            if subject_protection is not None:
+                ghost_alpha *= 1.0 - subject_protection
+            ghost_alpha_3ch = ghost_alpha[:, :, np.newaxis]
             current_canvas = (
                 ghost['frame'] * ghost_alpha_3ch + current_canvas * (1 - ghost_alpha_3ch)
             ).astype(np.uint8)
         return current_canvas
 
-    def compose_static_ghosts(self, background, all_ghosts, permanent_indices):
+    def compose_static_ghosts(self, background, all_ghosts, permanent_indices,
+                              live_subject_alpha=None,
+                              live_subject_alpha_threshold=16,
+                              live_subject_protect_dilate=2):
         current_canvas = background.copy()
+        subject_protection = self.build_subject_protection_mask(
+            live_subject_alpha,
+            live_subject_alpha_threshold,
+            live_subject_protect_dilate,
+        )
         for p_idx in permanent_indices:
             ghost = all_ghosts[p_idx]
             ghost_opacity = ghost.get('opacity', 1.0)
-            ghost_alpha_3ch = np.repeat(
-                ghost['alpha'][:, :, np.newaxis], 3, axis=2
-            ) / 255.0 * ghost_opacity
+            ghost_alpha = ghost['alpha'].astype(np.float32) / 255.0 * ghost_opacity
+            if subject_protection is not None:
+                ghost_alpha *= 1.0 - subject_protection
+            ghost_alpha_3ch = ghost_alpha[:, :, np.newaxis]
             current_canvas = (
                 ghost['frame'] * ghost_alpha_3ch + current_canvas * (1 - ghost_alpha_3ch)
             ).astype(np.uint8)
@@ -604,7 +648,10 @@ class SpacetimeSlicer:
             out.write(cv2.addWeighted(first_frame, 1.0 - ratio, second_frame, ratio, 0))
 
     def process_fade_out(self, out, all_ghosts, permanent_indices, background, total_fade_frames,
-                         stretch_fade=1, transition_from=None, recovery_transition_frames=0):
+                         stretch_fade=1, transition_from=None, recovery_transition_frames=0,
+                         subject_protection_alpha=None,
+                         live_subject_alpha_threshold=16,
+                         live_subject_protect_dilate=2):
         """处理片尾淡出（应用残影透明度渐变，保留原残影的透明度）"""
         output_fade_frames = total_fade_frames * max(1, stretch_fade)
         print(f"\n写入片尾（定格 + 残影回收消失）...")
@@ -624,6 +671,11 @@ class SpacetimeSlicer:
         ghost_trajectories = self.build_recovery_trajectories(
             permanent_indices, last_ghost_idx, output_fade_frames
         )
+        subject_protection = self.build_subject_protection_mask(
+            subject_protection_alpha,
+            live_subject_alpha_threshold,
+            live_subject_protect_dilate,
+        )
 
         if len(ghost_trajectories) == 0:
             print("  无法构建残影序列，直接写入定格帧")
@@ -634,7 +686,12 @@ class SpacetimeSlicer:
             return
 
         first_recovery_frame = self.compose_recovery_frame(
-            all_ghosts, permanent_indices, ghost_trajectories, background, 0
+            all_ghosts,
+            permanent_indices,
+            ghost_trajectories,
+            background,
+            0,
+            subject_protection=subject_protection,
         )
         if transition_from is not None:
             self.write_canvas_transition(
@@ -643,7 +700,12 @@ class SpacetimeSlicer:
 
         for frame_offset in range(output_fade_frames):
             current_canvas = self.compose_recovery_frame(
-                all_ghosts, permanent_indices, ghost_trajectories, background, frame_offset
+                all_ghosts,
+                permanent_indices,
+                ghost_trajectories,
+                background,
+                frame_offset,
+                subject_protection=subject_protection,
             )
             out.write(current_canvas)
             print(f"  > 消失进度: {frame_offset+1}/{output_fade_frames}", end='\r')
@@ -666,6 +728,7 @@ class SpacetimeSlicer:
                  effect_base_mode='patched_canvas',
                  live_subject_opacity=1.0,
                  live_subject_alpha_threshold=16,
+                 live_subject_protect_dilate=2,
                  centroid_mask=False,
                  ffmpeg_executable=None,
                  h264_crf=18,
@@ -677,11 +740,10 @@ class SpacetimeSlicer:
           1. 片头: 0 -> effect_start_idx（固定机位原样播放）
           2. 特效段: effect_start_idx -> slice_end_idx（残影+透明度渐变）
              - 残影捕获时以 alpha 遮罩切割人物
-             - 残影以 ghost-burn 方式叠加到持久 canvas 上
-               (仅 alpha > live_subject_alpha_threshold 的像素参与烧入)
-             - 每帧输出时 live-subject mask 使用同一阈值判定人物区域
-               (alpha > threshold → 显示当前人物; 否则 → 透出 canvas 残影)
-             - 两处共用同一阈值保证 canvas 足迹与人物 mask 空间对齐
+             - source: 完整原始帧作为可见底图，仅显示间隔命中的残影；
+               每帧 alpha 只限制残影覆盖当前人物，并提供回收轨迹
+             - patched_canvas: 残影烧入持久 canvas，并用每帧 live-subject
+               mask 将当前人物覆盖在 canvas 上
           3. 回收窗口: slice_end_idx+1 -> freeze_idx（回收所有残影）
           4. 凝结转场: 按 camera_ids 顺序输出各机位 freeze_idx 帧
           5. 继续播放: freeze_idx+1 -> effect_end_idx（终止机位原样播放）
@@ -709,6 +771,8 @@ class SpacetimeSlicer:
             raise ValueError("live_subject_opacity must be between 0 and 1")
         if not 0 <= live_subject_alpha_threshold <= 255:
             raise ValueError("live_subject_alpha_threshold must be between 0 and 255")
+        if live_subject_protect_dilate < 0:
+            raise ValueError("live_subject_protect_dilate must not be negative")
         if not effect_start_idx < freeze_idx < effect_end_idx:
             raise ValueError("Expected effect_start_idx < freeze_idx < effect_end_idx")
         if fade_duration_frames is not None and fade_duration_frames < 1:
@@ -809,7 +873,10 @@ class SpacetimeSlicer:
             print(f"   回收窗口: {slice_end_idx + 1} -> {freeze_idx} ({total_fade_frames} 帧)")
         else:
             print(f"   回收窗口: freeze 帧之后插入 {total_fade_frames} 帧")
-        print("   特效底图模式: source（原始视频帧 + 已捕获切片）")
+        if effect_base_mode == 'source':
+            print("   特效底图模式: source（完整原始帧 + 人物顶层保护 + 已捕获切片）")
+        else:
+            print("   特效底图模式: patched_canvas（当前人物 + 持久残影画布）")
         source_start_frame = self.read_frame(effect_start_idx, start_cam).copy()
         initial_subject_replacement = self.resolve_initial_subject_replacement(
             initial_subject_patch_mode,
@@ -827,6 +894,11 @@ class SpacetimeSlicer:
         else:
             raise ValueError(f"Unknown initial canvas mode: {initial_canvas_mode}")
         print(f"   Effect base mode: {effect_base_mode}, initial canvas: {initial_canvas_mode}")
+        tracking_end_idx = (
+            freeze_idx + 1
+            if effect_base_mode == 'source'
+            else slice_end_idx + 1
+        )
         ghost_count, last_effect_frame = self.process_segment(
             strategy, start_cam, effect_start_idx, slice_end_idx + 1,
             ghost_interval, edge_feather, all_ghosts, permanent_indices, out,
@@ -840,6 +912,8 @@ class SpacetimeSlicer:
             effect_base_mode=effect_base_mode,
             live_subject_opacity=live_subject_opacity,
             live_subject_alpha_threshold=live_subject_alpha_threshold,
+            live_subject_protect_dilate=live_subject_protect_dilate,
+            tracking_end_idx=tracking_end_idx,
         )
 
         # ============ 3. 片尾淡出: 回收所有残影 ============
@@ -851,10 +925,21 @@ class SpacetimeSlicer:
             fade_background = source_start_frame
         else:
             raise ValueError(f"Unknown background mode: {background_mode}")
+
+        recovery_subject_alpha = None
+        if effect_base_mode == 'source' and all_ghosts:
+            if background_mode == 'freeze':
+                recovery_subject_alpha = all_ghosts[-1]['alpha']
+            elif background_mode == 'start':
+                recovery_subject_alpha = all_ghosts[0]['alpha']
+
         self.process_fade_out(out, all_ghosts, permanent_indices, fade_background, total_fade_frames,
                               stretch_fade=stretch_fade,
                               transition_from=last_effect_frame,
-                              recovery_transition_frames=recovery_transition_frames)
+                              recovery_transition_frames=recovery_transition_frames,
+                              subject_protection_alpha=recovery_subject_alpha,
+                              live_subject_alpha_threshold=live_subject_alpha_threshold,
+                              live_subject_protect_dilate=live_subject_protect_dilate)
 
         # ============ 4. 凝结转场: 多机位环绕 ============
         print(f"\n进入凝结状态，多机位环绕...")

@@ -479,7 +479,7 @@ python build_spacetime_slicer.py `
 
 | 参数 | 默认值 | 说明 |
 | --- | --- | --- |
-| `--effect_base_mode` | `patched_canvas` | `patched_canvas` 持续合成画布；`source` 使用每个原始帧作为底图 |
+| `--effect_base_mode` | `patched_canvas` | `patched_canvas` 持续合成画布；`source` 保留完整原始帧，并用逐帧 RVM Alpha 阻止历史残影覆盖当前人物 |
 | `--background_mode` | `freeze` | 回收背景：`freeze`、`median` 或 `start` |
 | `--initial_canvas_mode` | `patched_start` | 初始画布：主体修补后的起始帧，或 `clean` 替换帧 |
 | `--initial_subject_patch_mode` | `freeze` | 起始主体替换来源：`none`、`median`、`freeze` 或 `frame` |
@@ -487,8 +487,16 @@ python build_spacetime_slicer.py `
 | `--source_sequence_dir` | 自动 | 完整原始图片顺序目录；批处理自动使用重组器生成的 `重命名数据` |
 | `--initial_patch_alpha_threshold` | `1` | 起始主体修补 Alpha 阈值，范围 0–255 |
 | `--initial_patch_dilate` | `1` | 修补掩码膨胀像素数 |
-| `--live_subject_alpha_threshold` | `16` | 当前主体保留阈值，范围 0–255 |
+| `--live_subject_alpha_threshold` | `16` | 当前主体保护阈值，范围 0–255；source 中只限制残影覆盖，不重建人物 |
+| `--live_subject_protect_dilate` | `2` | source 人物保护遮罩的 3×3 膨胀次数，同时用于 freeze 回收人物保护 |
 | `--live_subject_opacity` | `1.0` | 当前主体不透明度，范围 0–1 |
+
+`source` 模式仍会在特效跟踪范围内逐帧运行分割并保存主体轨迹，但非切片帧
+的 Alpha 不用于抠出或重建当前人物。输出始终以完整原始帧为基础，当前帧 Alpha
+只生成保护遮罩，将与真实人物重叠的历史残影 Alpha 裁掉。因此真实人物位于残影
+之上，保护区内保留原始像素，保护区外的残影继续显示。只有 `ghost_interval`
+命中的样本会成为永久残影；隐藏的逐帧样本同时供保护遮罩和后续回收到
+`freeze_frame` 姿态使用。source 首帧也保留完整原始人物，不应用起始人物背景修补。
 
 `initial_subject_patch_mode=frame` 的编号不再使用合成后的时间轴帧数，而是使用
 重组前全部输入图片的顺序编号。假设原始输入共 239 张图片，重组后的合成时间轴

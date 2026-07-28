@@ -18,6 +18,7 @@
   "initial_patch_alpha_threshold": 1,
   "initial_patch_dilate": 1,
   "live_subject_alpha_threshold": 16,
+  "live_subject_protect_dilate": 2,
   "live_subject_opacity": 1.0,
   "effect_base_mode": "patched_canvas",
   "debug_extract_frames": null,
