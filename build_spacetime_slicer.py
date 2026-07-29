@@ -340,7 +340,7 @@ def build_parser():
     parser.add_argument('--live_subject_opacity', type=float, default=1.0, help='Opacity of the current live subject in patched_canvas mode')
     parser.add_argument(
         '--effect_base_mode',
-        default='patched_canvas',
+        default='source',
         choices=['patched_canvas', 'source'],
         help=(
             'patched_canvas mattes the current subject over a persistent canvas; '

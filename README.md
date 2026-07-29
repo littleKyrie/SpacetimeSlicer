@@ -430,6 +430,8 @@ python build_spacetime_slicer.py `
 ### 核心参数
 
 下表默认值来自 `configs/spacetime_slicer.json`。
+本节参数均对 `patched_canvas` 和 `source` 两种模式生效；输入输出、帧范围和编码参数
+属于通用流程，残影间隔、不透明度及 Alpha 边缘处理会作用于两种模式各自的合成逻辑。
 
 | 参数 | 默认值 | 说明 |
 | --- | --- | --- |
@@ -440,7 +442,7 @@ python build_spacetime_slicer.py `
 | `--fps` | `25` | 输出 MP4 帧率 |
 | `--start_frame` | `25` | 残影开始源帧，从 1 开始 |
 | `--freeze_frame` | `125` | 残影恢复完成并开始多机位冻结环绕的源帧 |
-| `--end_frame` | `null` | 输出结束源帧；为空时使用起始机位最后一帧 |
+| `--end_frame` | `null` | 输出结束源帧；为空时使用对应机位最后一帧 |
 | `--method` | `RVM` | 主体分割策略 |
 | `--ghost_interval` | `20` | 残影捕获间隔，必须大于等于 1 |
 | `--ghost_opacity_start` | `0.2` | 第一组残影不透明度 |
@@ -449,6 +451,9 @@ python build_spacetime_slicer.py `
 | `--edge_feather` | `0` | Alpha 边缘羽化像素数 |
 
 ### 分割策略
+
+下列 `--method` 分割策略均可用于 `patched_canvas` 和 `source`。两种模式都会逐帧取得
+分割 Alpha，区别仅在后续如何使用 Alpha 和原始帧。
 
 | `--method` | 说明 | 依赖 |
 | --- | --- | --- |
@@ -459,6 +464,9 @@ python build_spacetime_slicer.py `
 | `rembg-<model>` | 使用 rembg 会话，例如 `rembg-u2net` | 兼容版本的 rembg 和 ONNX Runtime |
 
 ### 时间与插值参数
+
+本节参数均对 `patched_canvas` 和 `source` 两种模式生效，包括片头、特效段、回收段、
+冻结环绕和片尾的时长扩展，以及恢复时机和转场设置。
 
 | 参数 | 默认值 | 说明 |
 | --- | --- | --- |
@@ -477,19 +485,26 @@ python build_spacetime_slicer.py `
 
 ### 画布与主体修补参数
 
-| 参数 | 默认值 | 说明 |
-| --- | --- | --- |
-| `--effect_base_mode` | `patched_canvas` | `patched_canvas` 持续合成画布；`source` 保留完整原始帧，并用逐帧 RVM Alpha 阻止历史残影覆盖当前人物 |
-| `--background_mode` | `freeze` | 回收背景：`freeze`、`median` 或 `start` |
-| `--initial_canvas_mode` | `patched_start` | 初始画布：主体修补后的起始帧，或 `clean` 替换帧 |
-| `--initial_subject_patch_mode` | `freeze` | 起始主体替换来源：`none`、`median`、`freeze` 或 `frame` |
-| `--initial_subject_patch_frame` | 冻结帧 | `frame` 模式使用的完整原始输入图片序号，从 1 开始 |
-| `--source_sequence_dir` | 自动 | 完整原始图片顺序目录；批处理自动使用重组器生成的 `重命名数据` |
-| `--initial_patch_alpha_threshold` | `1` | 起始主体修补 Alpha 阈值，范围 0–255 |
-| `--initial_patch_dilate` | `1` | 修补掩码膨胀像素数 |
-| `--live_subject_alpha_threshold` | `16` | 当前主体保护阈值，范围 0–255；source 中只限制残影覆盖，不重建人物 |
-| `--live_subject_protect_dilate` | `2` | source 人物保护遮罩的 3×3 膨胀次数，同时用于 freeze 回收人物保护 |
-| `--live_subject_opacity` | `1.0` | 当前主体不透明度，范围 0–1 |
+下表的“适用模式”指参数是否会改变最终合成画面：
+
+| 参数 | 默认值 | 适用模式 | 说明 |
+| --- | --- | --- | --- |
+| `--effect_base_mode` | `patched_canvas` | 两种模式（模式选择） | `patched_canvas` 以修补后的起始帧初始化持久画布，之后不断把命中的残影烧入这张画布，当前帧人物再通过分割 mask 覆盖到持久画布上；`source` 每帧保留完整原始帧，并用逐帧分割 Alpha 阻止历史残影覆盖当前人物 |
+| `--background_mode` | `freeze` | 两种模式 | 选择残影回收阶段的背景：`freeze`、`median` 或 `start` |
+| `--initial_canvas_mode` | `patched_start` | 仅 `patched_canvas` | 选择持久画布的初始内容：`patched_start` 使用主体修补后的起始帧，`clean` 使用替换帧；`source` 每帧都以当前完整原始帧为底图，不使用该持久画布 |
+| `--initial_subject_patch_mode` | `freeze` | 仅 `patched_canvas` | 起始主体替换来源：`none`、`median`、`freeze` 或 `frame`；`source` 不需要填补特效首帧人物区域 |
+| `--initial_subject_patch_frame` | 冻结帧 | 仅 `patched_canvas` | `initial_subject_patch_mode=frame` 时使用的完整原始输入图片序号，从 1 开始 |
+| `--source_sequence_dir` | 自动 | 仅 `patched_canvas` 的 `frame` 修补 | 完整原始图片顺序目录，供 `initial_subject_patch_mode=frame` 读取替换帧；批处理自动使用重组器生成的 `重命名数据` |
+| `--initial_patch_alpha_threshold` | `1` | 仅 `patched_canvas` | 把起始帧 Alpha 转成主体修补掩码的阈值，范围 0–255 |
+| `--initial_patch_dilate` | `1` | 仅 `patched_canvas` | 起始主体修补掩码的 3×3 膨胀次数，用于扩大需要替换的边缘区域 |
+| `--live_subject_alpha_threshold` | `16` | 两种模式 | 范围 0–255。`patched_canvas` 中同时控制当前人物覆盖 mask 和残影烧入过滤；`source` 中控制当前人物保护 mask，并在适用的回收背景上保护人物区域 |
+| `--live_subject_protect_dilate` | `2` | 仅 `source` | 当前人物保护 mask 的 3×3 膨胀次数，同时用于 `source` 生成阶段和适用的 freeze/start 回收人物保护；不参与 `patched_canvas` 的人物合成 |
+| `--live_subject_opacity` | `1.0` | 仅 `patched_canvas` | 当前帧人物覆盖到持久画布时的不透明度，范围 0–1；`source` 直接保留完整原始帧，不使用该不透明度 |
+
+“仅 `patched_canvas`”表示参数不会改变 `source` 的可见合成结果。当前实现为了共用初始化
+流程，`source` 运行时仍可能解析或读取 `initial_subject_patch_*` 和
+`source_sequence_dir` 指定的替换帧，但替换结果不会参与 `source` 画面合成，因此无需为
+`source` 专门配置这些参数。
 
 `source` 模式仍会在特效跟踪范围内逐帧运行分割并保存主体轨迹，但非切片帧
 的 Alpha 不用于抠出或重建当前人物。输出始终以完整原始帧为基础，当前帧 Alpha
@@ -498,7 +513,88 @@ python build_spacetime_slicer.py `
 命中的样本会成为永久残影；隐藏的逐帧样本同时供保护遮罩和后续回收到
 `freeze_frame` 姿态使用。source 首帧也保留完整原始人物，不应用起始人物背景修补。
 
-`initial_subject_patch_mode=frame` 的编号不再使用合成后的时间轴帧数，而是使用
+#### `source` 模式的实际合成顺序
+
+`source` 在特效跟踪范围内仍然逐帧执行 RVM，但不同帧的 Alpha 有不同用途：
+
+1. 每一帧的原图和 Alpha 都保存为密集轨迹样本，维持 RVM 时序并供残影回收使用。
+2. 只有命中 `ghost_interval` 的样本加入永久残影列表并获得对应
+   `ghost_opacity`；其他密集样本不会在生成阶段显示。
+3. 每个输出帧都重新从该帧完整原始图开始，不复用上一帧的 source 画布。
+4. 当前帧 RVM Alpha 只构造人物保护遮罩，不负责抠出、重建或替换当前人物 RGB。
+5. 每个历史永久残影的有效 Alpha 按以下方式裁减后再叠加：
+
+```text
+有效残影 Alpha
+= 历史残影 Alpha
+× 残影 opacity
+× (1 - 当前人物保护遮罩)
+```
+
+因此保护区内直接保留当前原始帧像素，保护区外继续显示历史残影。画面层级为：
+
+```text
+当前原始帧人物
+历史永久残影
+当前原始帧背景
+```
+
+该保证以当前人物被 RVM 正确识别为前提。如果帽檐、手指、衣袖或运动模糊区域漏分，
+残影仍可能从漏分位置穿透。source 不使用 `initial_subject_patch_mode` 修补首帧：
+首张残影在捕获瞬间被当前人物遮住，人物移动后才从其原位置显露。
+
+#### `source` 人物保护参数
+
+`live_subject_alpha_threshold` 先把连续 RVM Alpha 转换为硬二值保护区：
+
+```python
+protection_mask = alpha_mask > live_subject_alpha_threshold
+```
+
+- 值越低：更多低置信度边缘被认为是人物，保护区扩大，残影更不容易穿透，但人物与
+  残影之间可能出现更宽的暗色隔离带。
+- 值越高：保护区向人物内部收缩，残影更靠近人物，暗边可能变窄，但低置信度人物边缘
+  可能被残影覆盖。
+- 调高 threshold 不会使边界更模糊，只会移动硬二值边界。
+
+`live_subject_protect_dilate` 在 threshold 二值化后，用 3×3 核继续膨胀保护区：
+
+- `0`：不额外扩张。
+- `1`：向四周扩张约 1 像素。
+- `2`：向四周扩张约 2 像素，也是当前默认值。
+- 值越大：边缘保护越强，但人物与残影之间的原始背景隔离带也可能越宽。
+
+出现人物周围黑边时，可按顺序尝试：
+
+```text
+threshold=16, dilate=0
+threshold=24, dilate=0
+threshold=32, dilate=0
+threshold=32, dilate=1
+```
+
+例如：
+
+```powershell
+python batch_run.py `
+  --sub_dir 0728 `
+  --effect_base_mode source `
+  --live_subject_alpha_threshold 32 `
+  --live_subject_protect_dilate 0 `
+  ...
+```
+
+较高 threshold 与较小 dilate 通常可以缩窄 source 中的暗色隔离带，但会增加残影侵入
+人物边缘的风险。这两个参数只能改变硬边界的位置和宽度，不能让边界真正柔和；如果
+仍有明显描边，需要进一步使用软 Alpha 或对人物保护遮罩增加羽化。
+
+`live_subject_protect_dilate` 当前只用于 source 生成阶段和 source 回收阶段的
+freeze 人物保护，不参与 `patched_canvas` 的逐帧人物合成。`patched_canvas`
+起始人物背景修补使用的是 `initial_patch_alpha_threshold` 和
+`initial_patch_dilate`，不要混用两组参数的含义。
+
+以下 `initial_subject_patch_mode=frame` 用法仅适用于 `patched_canvas`。它的编号不再
+使用合成后的时间轴帧数，而是使用
 重组前全部输入图片的顺序编号。假设原始输入共 239 张图片，重组后的合成时间轴
 只有 148 或 149 帧，仍然可以使用 `1–239` 中的任意编号，包括中间的环形相机
 图片。例如选择原始输入中的第 200 张：
@@ -525,6 +621,7 @@ python build_spacetime_slicer.py `
 ### 调试导出
 
 以下命令导出指定帧的 RVM Alpha、前景和黑底预览，然后退出，不生成完整视频：
+调试导出独立于画布合成方式，可用于 `patched_canvas` 和 `source` 两种模式。
 
 ```powershell
 python build_spacetime_slicer.py `

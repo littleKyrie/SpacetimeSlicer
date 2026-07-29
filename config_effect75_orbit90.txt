@@ -33,6 +33,12 @@ SpacetimeSlicer：前 75 帧全部作为特效段、无片头、90 机位环绕�
     freeze_interp_mode = rife
     recovery_timing = after_freeze
 
+source 模式建议明确设置：
+
+    effect_base_mode = source
+    live_subject_alpha_threshold = 16
+    live_subject_protect_dilate = 2
+
 命令行直接运行
 --------------
 
@@ -70,6 +76,89 @@ SpacetimeSlicer：前 75 帧全部作为特效段、无片头、90 机位环绕�
     "end_frame": null
 
 这样程序会自动使用重组后起始机位的最后一帧作为结束帧。
+
+source 模式执行逻辑
+-------------------
+
+source 在 start_frame 到 freeze_frame 的跟踪范围内逐帧执行 RVM：
+
+1. 每帧原图和 Alpha 都保存为密集轨迹样本，用于维持 RVM 时序和后续残影回收。
+2. 只有 ghost_interval 命中的帧进入永久残影列表；其他逐帧样本不会在生成阶段显示。
+3. 每个输出帧都以该帧完整原始图重新开始合成，不沿用上一帧 source 画布。
+4. 当前帧 RVM Alpha 只生成真实人物保护遮罩，不抠出或重建当前人物 RGB。
+5. 历史残影与保护区重叠的位置会从残影 Alpha 中扣除：
+
+    有效残影 Alpha
+    = 历史残影 Alpha
+    × 残影 opacity
+    × (1 - 当前人物保护遮罩)
+
+最终层级：
+
+    当前原始帧人物
+    历史永久残影
+    当前原始帧背景
+
+保护区内保留当前原始帧像素，保护区外显示永久残影。该行为依赖当前人物 RVM
+识别结果；如果手指、帽檐、衣袖或运动模糊区域漏分，残影仍可能在漏分位置穿透。
+
+source 首帧不使用 initial_subject_patch_mode 做人物背景修补。首张残影在捕获
+瞬间与当前人物重合，因此被当前人物遮住；人物移动后才从原位置显露。起始人物
+背景修补主要用于 patched_canvas 的持久画布。
+
+source 黑边与调参
+-----------------
+
+当前人物保护遮罩采用硬二值判断：
+
+    protection_mask = alpha_mask > live_subject_alpha_threshold
+
+live_subject_alpha_threshold：
+
+- 范围 0 至 255，默认 16。
+- 值降低：更多低 Alpha 边缘进入保护区，残影更不容易穿透，但暗色隔离带可能变宽。
+- 值提高：保护区向人物内部收缩，残影更靠近人物，暗边可能变窄，但低置信度人物
+  边缘可能被残影覆盖。
+- threshold 只移动硬边界，不会让边界变模糊。
+
+live_subject_protect_dilate：
+
+- 默认 2，在 threshold 判断后用 3×3 核膨胀保护区。
+- 0 表示不额外扩张；1、2 分别向周围扩张约 1、2 像素。
+- 值增大可以减少残影穿透，但可能扩大人物和残影之间显露出的原始背景间隔。
+
+出现黑边时，建议依次测试：
+
+    live_subject_alpha_threshold = 16
+    live_subject_protect_dilate = 0
+
+    live_subject_alpha_threshold = 24
+    live_subject_protect_dilate = 0
+
+    live_subject_alpha_threshold = 32
+    live_subject_protect_dilate = 0
+
+    live_subject_alpha_threshold = 32
+    live_subject_protect_dilate = 1
+
+推荐先运行：
+
+    uv run python batch_run.py `
+      --sub_dir 0722 `
+      --effect_base_mode source `
+      --pre-frame-count 75 `
+      --start_frame 1 `
+      --freeze_frame 75 `
+      --live_subject_alpha_threshold 32 `
+      --live_subject_protect_dilate 0
+
+较高 threshold 与较小 dilate 通常会缩窄 source 的暗色隔离带，但也会提高残影
+侵入人物边缘的风险。两个参数只能调整硬边界位置和宽度，不能真正软化边缘；如果
+仍有明显描边，需要改用软 Alpha 或对保护遮罩增加羽化。
+
+注意：live_subject_protect_dilate 当前只用于 source 生成阶段以及 source 回收阶段
+的 freeze 人物保护，不参与 patched_canvas 的逐帧人物合成。patched_canvas
+起始人物修补对应的参数是 initial_patch_alpha_threshold 和 initial_patch_dilate。
 
 JSON 配置片段
 -------------
