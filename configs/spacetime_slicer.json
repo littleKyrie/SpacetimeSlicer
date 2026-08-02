@@ -39,5 +39,6 @@
   "ffmpeg_exe": null,
   "h264_crf": 18,
   "h264_preset": "medium",
-  "method": "RVM"
+  "method": "RVM",
+  "centroid-mask": true
 }
