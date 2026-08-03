@@ -1,6 +1,6 @@
 {
   "reorganize_config": "reorganize_frame_images.json",
   "slicer_config": "spacetime_slicer.json",
-  "data_root": "data",
+  "data_root": "Y:\\0803\\关键帧",
   "output_dir": null
 }
