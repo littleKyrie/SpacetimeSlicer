@@ -40,5 +40,6 @@
   "h264_crf": 18,
   "h264_preset": "medium",
   "method": "RVM",
-  "centroid_mask": true
+  "centroid_mask": true,
+  "multi_subject_mode": "all_components"
 }

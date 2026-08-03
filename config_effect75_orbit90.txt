@@ -32,6 +32,7 @@ SpacetimeSlicer：前 75 帧全部作为特效段、无片头、90 机位环绕�
     stretch_tail = 1
     freeze_interp_mode = rife
     recovery_timing = after_freeze
+    multi_subject_mode = largest_component
 
 source 模式建议明确设置：
 
@@ -105,6 +106,19 @@ source 在 start_frame 到 freeze_frame 的跟踪范围内逐帧执行 RVM：
 source 首帧不使用 initial_subject_patch_mode 做人物背景修补。首张残影在捕获
 瞬间与当前人物重合，因此被当前人物遮住；人物移动后才从原位置显露。起始人物
 背景修补主要用于 patched_canvas 的持久画布。
+
+多人残影回收
+-------------
+
+默认 multi_subject_mode=largest_component 保持现有行为：回收插值只裁取最大 Alpha
+连通区域。若同一帧包含多个分离人物，较小人物可能在首次非整数轨迹插值时直接消失。
+
+多人素材可以显式设置：
+
+    --multi_subject_mode all_components
+
+该模式保留全部前景区域，并把它们作为一个群体残影进行回收。它不统计人数、不区分
+人物身份，也不为每个人建立独立轨迹；多人独立运动或交叉时仍可能出现群体轨迹不自然。
 
 source 黑边与调参
 -----------------
@@ -180,7 +194,8 @@ configs/spacetime_slicer.json 中对应字段：
       "camera_ids": "1:90",
       "start_frame": 1,
       "freeze_frame": 75,
-      "end_frame": null
+      "end_frame": null,
+      "multi_subject_mode": "largest_component"
     }
 
 准确的帧含义

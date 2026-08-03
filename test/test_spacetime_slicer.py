@@ -207,6 +207,65 @@ class SpacetimeSlicerTest(unittest.TestCase):
 
         self.assertEqual(args.recovery_timing, 'before_freeze')
 
+    def test_multi_subject_mode_defaults_to_largest_component(self):
+        args = build_parser().parse_args([
+            '--input_dir', 'data',
+            '--output_dir', 'results',
+            '--freeze_frame', '125',
+        ])
+
+        self.assertEqual(args.multi_subject_mode, 'largest_component')
+
+    def test_cli_accepts_all_components_multi_subject_mode(self):
+        args = build_parser().parse_args([
+            '--input_dir', 'data',
+            '--output_dir', 'results',
+            '--freeze_frame', '125',
+            '--multi_subject_mode', 'all_components',
+        ])
+
+        self.assertEqual(args.multi_subject_mode, 'all_components')
+
+    def test_config_multi_subject_mode_can_be_overridden_by_cli(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / 'slicer.json'
+            config_path.write_text(json.dumps({
+                'input_dir': 'config-input',
+                'output_dir': 'config-output',
+                'freeze_frame': 125,
+                'multi_subject_mode': 'all_components',
+            }), encoding='utf-8')
+
+            args = build_parser().parse_args([
+                '--config', str(config_path),
+                '--multi_subject_mode', 'largest_component',
+            ])
+
+            self.assertEqual(args.multi_subject_mode, 'largest_component')
+
+    def test_config_accepts_all_components_multi_subject_mode(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / 'slicer.json'
+            config_path.write_text(json.dumps({
+                'input_dir': 'config-input',
+                'output_dir': 'config-output',
+                'freeze_frame': 125,
+                'multi_subject_mode': 'all_components',
+            }), encoding='utf-8')
+
+            args = build_parser().parse_args(['--config', str(config_path)])
+
+            self.assertEqual(args.multi_subject_mode, 'all_components')
+
+    def test_cli_rejects_unknown_multi_subject_mode(self):
+        with self.assertRaises(SystemExit):
+            build_parser().parse_args([
+                '--input_dir', 'data',
+                '--output_dir', 'results',
+                '--freeze_frame', '125',
+                '--multi_subject_mode', 'unknown',
+            ])
+
     def test_config_supplies_arguments_and_cli_overrides_config(self):
         with tempfile.TemporaryDirectory() as tmp:
             config_path = Path(tmp) / 'slicer.json'
@@ -670,6 +729,112 @@ class SpacetimeSlicerTest(unittest.TestCase):
             np.array([5.0, 5.0, 4.0, 6.0], dtype=np.float32),
         )
 
+    def test_all_components_geometry_uses_union_bbox_and_full_alpha_centroid(self):
+        slicer = SpacetimeSlicer.__new__(SpacetimeSlicer)
+        slicer.multi_subject_mode = 'all_components'
+        alpha = np.zeros((10, 20), dtype=np.uint8)
+        alpha[2:8, 2:6] = 255
+        alpha[3:7, 14:17] = 255
+        ghost = {
+            'frame': np.zeros((10, 20, 3), dtype=np.uint8),
+            'alpha': alpha,
+        }
+
+        slicer.use_centroid = False
+        bbox_geometry = slicer.get_ghost_geometry(ghost)
+        np.testing.assert_array_equal(
+            bbox_geometry,
+            np.array([9.5, 5.0, 15.0, 6.0], dtype=np.float32),
+        )
+
+        slicer.use_centroid = True
+        centroid_geometry = slicer.get_ghost_geometry(ghost)
+        np.testing.assert_allclose(
+            centroid_geometry,
+            np.array([22.0 / 3.0, 4.5, 15.0, 6.0], dtype=np.float32),
+        )
+
+    def test_geometry_cache_is_isolated_by_multi_subject_mode(self):
+        slicer = SpacetimeSlicer.__new__(SpacetimeSlicer)
+        slicer.use_centroid = False
+        alpha = np.zeros((10, 20), dtype=np.uint8)
+        alpha[2:8, 2:6] = 255
+        alpha[3:7, 14:17] = 255
+        ghost = {
+            'frame': np.zeros((10, 20, 3), dtype=np.uint8),
+            'alpha': alpha,
+        }
+
+        slicer.multi_subject_mode = 'largest_component'
+        largest_geometry = slicer.get_ghost_geometry(ghost)
+        slicer.multi_subject_mode = 'all_components'
+        union_geometry = slicer.get_ghost_geometry(ghost)
+
+        np.testing.assert_array_equal(
+            largest_geometry,
+            np.array([4.0, 5.0, 4.0, 6.0], dtype=np.float32),
+        )
+        np.testing.assert_array_equal(
+            union_geometry,
+            np.array([9.5, 5.0, 15.0, 6.0], dtype=np.float32),
+        )
+
+    def test_single_subject_geometry_is_identical_in_both_modes(self):
+        slicer = SpacetimeSlicer.__new__(SpacetimeSlicer)
+        slicer.use_centroid = True
+        alpha = np.zeros((10, 20), dtype=np.uint8)
+        alpha[2:8, 3:7] = 255
+        ghost = {
+            'frame': np.zeros((10, 20, 3), dtype=np.uint8),
+            'alpha': alpha,
+        }
+
+        slicer.multi_subject_mode = 'largest_component'
+        largest_layout = slicer.get_ghost_layout(ghost)
+        slicer.multi_subject_mode = 'all_components'
+        union_layout = slicer.get_ghost_layout(ghost)
+
+        np.testing.assert_array_equal(
+            largest_layout['geometry'], union_layout['geometry']
+        )
+        self.assertEqual(largest_layout['bbox'], union_layout['bbox'])
+
+    def test_all_components_preserves_secondary_subject_during_fractional_recovery(self):
+        primary_alpha = np.zeros((10, 20), dtype=np.uint8)
+        primary_alpha[2:8, 2:6] = 255
+        primary_alpha[3:7, 14:17] = 255
+        next_alpha = np.zeros((10, 20), dtype=np.uint8)
+        next_alpha[2:8, 3:7] = 255
+        next_alpha[3:7, 15:18] = 255
+        all_ghosts = [
+            {
+                'frame': np.full((10, 20, 3), 100, dtype=np.uint8),
+                'alpha': primary_alpha,
+            },
+            {
+                'frame': np.full((10, 20, 3), 200, dtype=np.uint8),
+                'alpha': next_alpha,
+            },
+        ]
+        slicer = SpacetimeSlicer.__new__(SpacetimeSlicer)
+        slicer.use_centroid = False
+
+        slicer.multi_subject_mode = 'largest_component'
+        largest_ghost = slicer.interpolate_ghost(all_ghosts, 0.5)
+        largest_count, _ = cv2.connectedComponents(
+            (largest_ghost['alpha'] > 0).astype(np.uint8)
+        )
+
+        slicer.multi_subject_mode = 'all_components'
+        union_ghost = slicer.interpolate_ghost(all_ghosts, 0.5)
+        union_count, _ = cv2.connectedComponents(
+            (union_ghost['alpha'] > 0).astype(np.uint8)
+        )
+
+        self.assertEqual(largest_count, 2)
+        self.assertEqual(union_count, 3)
+        self.assertGreater(np.count_nonzero(union_ghost['alpha'][:, 12:]), 0)
+
     def test_temporal_median_background_removes_transient_subject(self):
         frames = [
             np.zeros((1, 1, 3), dtype=np.uint8),
@@ -809,6 +974,12 @@ class SpacetimeSlicerTest(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, 'ghost_interval'):
             slicer.generate(None, 0, 0, 1, ghost_interval=0)
+
+    def test_generate_rejects_unknown_multi_subject_mode_before_writing_video(self):
+        slicer = make_slicer([np.zeros((1, 1, 3), dtype=np.uint8)])
+
+        with self.assertRaisesRegex(ValueError, 'multi-subject mode'):
+            slicer.generate(None, 0, 0, 1, multi_subject_mode='unknown')
 
 
 if __name__ == '__main__':

@@ -10,6 +10,7 @@ from utils.opencv_io import imread_required
 
 FRAME_DIR_PATTERN = re.compile(r'^\d+$')
 SOURCE_IMAGE_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.bmp', '.webp'}
+MULTI_SUBJECT_MODES = ('largest_component', 'all_components')
 
 
 def resolve_output_video_path(output_dir):
@@ -245,9 +246,18 @@ class SpacetimeSlicer:
         slice_end_idx = freeze_idx - total_fade_frames
         return slice_end_idx, total_fade_frames
 
-    def get_ghost_geometry(self, ghost):
-        if 'geometry' in ghost:
-            return ghost['geometry']
+    def get_ghost_layout(self, ghost):
+        """Return mode-specific recovery geometry and its matching alpha crop."""
+        multi_subject_mode = getattr(
+            self, 'multi_subject_mode', 'largest_component'
+        )
+        if multi_subject_mode not in MULTI_SUBJECT_MODES:
+            raise ValueError(f"Unknown multi-subject mode: {multi_subject_mode}")
+        use_centroid = getattr(self, 'use_centroid', False)
+        cache_key = (multi_subject_mode, use_centroid)
+        layout_cache = ghost.setdefault('layout_by_mode', {})
+        if cache_key in layout_cache:
+            return layout_cache[cache_key]
 
         binary_alpha = (ghost['alpha'] > 8).astype(np.uint8)
         component_count, _, component_stats, _ = cv2.connectedComponentsWithStats(
@@ -255,16 +265,25 @@ class SpacetimeSlicer:
         )
         if component_count <= 1:
             h, w = ghost['alpha'].shape
+            bbox = (0, 0, w, h)
             geometry = np.array([w / 2.0, h / 2.0, float(w), float(h)], dtype=np.float32)
         else:
-            primary_label = 1 + int(
-                np.argmax(component_stats[1:, cv2.CC_STAT_AREA])
-            )
-            x = component_stats[primary_label, cv2.CC_STAT_LEFT]
-            y = component_stats[primary_label, cv2.CC_STAT_TOP]
-            w = component_stats[primary_label, cv2.CC_STAT_WIDTH]
-            h = component_stats[primary_label, cv2.CC_STAT_HEIGHT]
-            if getattr(self, 'use_centroid', False):
+            if multi_subject_mode == 'largest_component':
+                primary_label = 1 + int(
+                    np.argmax(component_stats[1:, cv2.CC_STAT_AREA])
+                )
+                x = component_stats[primary_label, cv2.CC_STAT_LEFT]
+                y = component_stats[primary_label, cv2.CC_STAT_TOP]
+                w = component_stats[primary_label, cv2.CC_STAT_WIDTH]
+                h = component_stats[primary_label, cv2.CC_STAT_HEIGHT]
+            elif multi_subject_mode == 'all_components':
+                x, y, w, h = cv2.boundingRect(binary_alpha)
+            bbox = (x, y, w, h)
+            if use_centroid:
+                # Keep the existing all-alpha centroid semantics for
+                # largest_component. In all_components mode the same centroid
+                # is paired with the union bbox, so the anchor and crop cover
+                # the same foreground set.
                 moments = cv2.moments(binary_alpha)
                 if moments['m00'] > 0:
                     cx = moments['m10'] / moments['m00']
@@ -275,37 +294,25 @@ class SpacetimeSlicer:
                 geometry = np.array([cx, cy, float(w), float(h)], dtype=np.float32)
             else:
                 geometry = np.array([x + w / 2.0, y + h / 2.0, float(w), float(h)], dtype=np.float32)
-        ghost['geometry'] = geometry
-        return geometry
+        layout = {
+            'geometry': geometry,
+            'bbox': bbox,
+        }
+        layout_cache[cache_key] = layout
+        return layout
 
-    @staticmethod
-    def _get_alpha_bbox(alpha_mask):
-        """Return (x, y, w, h) bounding box of the largest alpha-connected foreground."""
-        binary_alpha = (alpha_mask > 8).astype(np.uint8)
-        component_count, _, component_stats, _ = cv2.connectedComponentsWithStats(
-            binary_alpha, connectivity=8
-        )
-        if component_count <= 1:
-            h, w = alpha_mask.shape
-            return 0, 0, w, h
-        primary_label = 1 + int(
-            np.argmax(component_stats[1:, cv2.CC_STAT_AREA])
-        )
-        return (
-            component_stats[primary_label, cv2.CC_STAT_LEFT],
-            component_stats[primary_label, cv2.CC_STAT_TOP],
-            component_stats[primary_label, cv2.CC_STAT_WIDTH],
-            component_stats[primary_label, cv2.CC_STAT_HEIGHT],
-        )
+    def get_ghost_geometry(self, ghost):
+        return self.get_ghost_layout(ghost)['geometry']
 
     def align_ghost_to_center(self, ghost, target_center):
         """Translate a cutout to the interpolated center without changing its body proportions."""
         frame_h, frame_w = ghost['alpha'].shape
-        source_geometry = self.get_ghost_geometry(ghost)
+        source_layout = self.get_ghost_layout(ghost)
+        source_geometry = source_layout['geometry']
 
         if getattr(self, 'use_centroid', False):
             # Centroid anchor: crop from bbox, place centroid at target_center.
-            bbox_x, bbox_y, bbox_w, bbox_h = self._get_alpha_bbox(ghost['alpha'])
+            bbox_x, bbox_y, bbox_w, bbox_h = source_layout['bbox']
             source_x, source_y = bbox_x, bbox_y
             source_w, source_h = bbox_w, bbox_h
             # source_geometry[0:2] is the centroid (cx, cy).
@@ -730,6 +737,7 @@ class SpacetimeSlicer:
                  live_subject_alpha_threshold=16,
                  live_subject_protect_dilate=2,
                  centroid_mask=False,
+                 multi_subject_mode='largest_component',
                  ffmpeg_executable=None,
                  h264_crf=18,
                  h264_preset='medium'):
@@ -773,6 +781,8 @@ class SpacetimeSlicer:
             raise ValueError("live_subject_alpha_threshold must be between 0 and 255")
         if live_subject_protect_dilate < 0:
             raise ValueError("live_subject_protect_dilate must not be negative")
+        if multi_subject_mode not in MULTI_SUBJECT_MODES:
+            raise ValueError(f"Unknown multi-subject mode: {multi_subject_mode}")
         if not effect_start_idx < freeze_idx < effect_end_idx:
             raise ValueError("Expected effect_start_idx < freeze_idx < effect_end_idx")
         if fade_duration_frames is not None and fade_duration_frames < 1:
@@ -788,6 +798,7 @@ class SpacetimeSlicer:
         if not 0 <= h264_crf <= 51:
             raise ValueError("h264_crf must be between 0 and 51")
         self.use_centroid = centroid_mask
+        self.multi_subject_mode = multi_subject_mode
         resolved_ffmpeg = resolve_ffmpeg_executable(ffmpeg_executable)
         start_cam = camera_ids[0]
         end_cam = camera_ids[-1]
@@ -831,6 +842,15 @@ class SpacetimeSlicer:
         print(
             f"H.264 encoding: libx264, CRF {h264_crf}, preset {h264_preset} "
             f"(FFmpeg: {resolved_ffmpeg})"
+        )
+        mode_description = (
+            "largest connected foreground only"
+            if multi_subject_mode == 'largest_component'
+            else "all foreground components as one group trajectory"
+        )
+        print(
+            f"Multi-subject recovery mode: {multi_subject_mode} "
+            f"({mode_description})"
         )
 
         sample_frame = self.read_frame(0, start_cam)

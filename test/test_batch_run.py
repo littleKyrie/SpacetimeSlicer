@@ -460,6 +460,7 @@ class BatchRunTest(unittest.TestCase):
             '--camera-count', '30',
             '--fps', '30',
             '--end_frame', '180',
+            '--multi_subject_mode', 'all_components',
         ])
         calls = {}
 
@@ -485,6 +486,9 @@ class BatchRunTest(unittest.TestCase):
         self.assertIn('30', calls['slicer'])
         self.assertIn('--end_frame', calls['slicer'])
         self.assertIn('180', calls['slicer'])
+        self.assertIn('--multi_subject_mode', calls['slicer'])
+        multi_subject_index = calls['slicer'].index('--multi_subject_mode') + 1
+        self.assertEqual(calls['slicer'][multi_subject_index], 'all_components')
         self.assertIn('./custom-output', calls['slicer'])
         self.assertIn('--source_sequence_dir', calls['slicer'])
         source_sequence_index = calls['slicer'].index('--source_sequence_dir') + 1

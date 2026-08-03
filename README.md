@@ -491,6 +491,7 @@ python build_spacetime_slicer.py `
 | --- | --- | --- | --- |
 | `--effect_base_mode` | `patched_canvas` | 两种模式（模式选择） | `patched_canvas` 以修补后的起始帧初始化持久画布，之后不断把命中的残影烧入这张画布，当前帧人物再通过分割 mask 覆盖到持久画布上；`source` 每帧保留完整原始帧，并用逐帧分割 Alpha 阻止历史残影覆盖当前人物 |
 | `--background_mode` | `freeze` | 两种模式 | 选择残影回收阶段的背景：`freeze`、`median` 或 `start` |
+| `--multi_subject_mode` | `largest_component` | 两种模式的回收阶段 | `largest_component` 只对齐最大 Alpha 连通区域并保持旧行为；`all_components` 保留全部前景区域，并将它们作为一个群体轨迹回收 |
 | `--initial_canvas_mode` | `patched_start` | 仅 `patched_canvas` | 选择持久画布的初始内容：`patched_start` 使用主体修补后的起始帧，`clean` 使用替换帧；`source` 每帧都以当前完整原始帧为底图，不使用该持久画布 |
 | `--initial_subject_patch_mode` | `freeze` | 仅 `patched_canvas` | 起始主体替换来源：`none`、`median`、`freeze` 或 `frame`；`source` 不需要填补特效首帧人物区域 |
 | `--initial_subject_patch_frame` | 冻结帧 | 仅 `patched_canvas` | `initial_subject_patch_mode=frame` 时使用的完整原始输入图片序号，从 1 开始 |
@@ -542,6 +543,30 @@ python build_spacetime_slicer.py `
 该保证以当前人物被 RVM 正确识别为前提。如果帽檐、手指、衣袖或运动模糊区域漏分，
 残影仍可能从漏分位置穿透。source 不使用 `initial_subject_patch_mode` 修补首帧：
 首张残影在捕获瞬间被当前人物遮住，人物移动后才从其原位置显露。
+
+#### 多人物回收模式
+
+RVM 每帧输出一张整体前景 Alpha，不提供人数或人物身份。当一张 Alpha 包含多个分离的
+人物区域时，`multi_subject_mode` 决定回收插值使用哪些区域：
+
+- `largest_component`：默认值，只裁取最大连通区域。它完全保持旧行为，但非最大人物可能
+  在残影首次进入非整数轨迹插值时消失。
+- `all_components`：使用全部前景像素的联合包围框和整体锚点，所有区域保持原有相对位置，
+  作为一个群体参与回收。
+
+多人素材可显式启用：
+
+```powershell
+python batch_run.py `
+  --sub_dir 0803 `
+  --dataset QPG_88-2026-08-03-130712 `
+  --multi_subject_mode all_components `
+  --force
+```
+
+`all_components` 只防止较小人物区域被最大连通区域裁剪丢弃。它不会自动统计人数、区分
+人物身份或为每个人建立独立轨迹；多人运动方向不同、互相交叉或距离很大时，整个群体的
+联合轨迹仍可能不够自然。
 
 #### `source` 人物保护参数
 

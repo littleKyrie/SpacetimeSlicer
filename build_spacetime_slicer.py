@@ -399,6 +399,16 @@ def build_parser():
              'during recovery (default: True). Disable with --no-centroid-mask '
              'to revert to bbox-center behaviour.',
     )
+    parser.add_argument(
+        '--multi_subject_mode',
+        default='largest_component',
+        choices=['largest_component', 'all_components'],
+        help=(
+            'Recovery handling for alpha masks containing multiple disconnected '
+            'subjects: largest_component preserves current behavior; '
+            'all_components moves every foreground component as one group.'
+        ),
+    )
     parser.add_argument('--method', default='RVM',
                         help='RVM, Hybrid, SAM2_BBox, RMBG2, or rembg-<model>')
     return parser
@@ -483,6 +493,7 @@ def main(argv=None):
             live_subject_alpha_threshold=args.live_subject_alpha_threshold,
             live_subject_protect_dilate=args.live_subject_protect_dilate,
             centroid_mask=args.centroid_mask,
+            multi_subject_mode=args.multi_subject_mode,
             ffmpeg_executable=args.ffmpeg_exe,
             h264_crf=args.h264_crf,
             h264_preset=args.h264_preset,
