@@ -68,7 +68,8 @@ class FfmpegH264Writer:
             '-c:v', 'libx264',
             '-preset', preset,
             '-crf', str(crf),
-            '-pix_fmt', 'yuv420p',
+            '-pix_fmt', 'yuv444p',
+            '-profile:v', 'high444',
             '-movflags', '+faststart',
             str(self.temporary_output),
         ]

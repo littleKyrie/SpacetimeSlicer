@@ -37,8 +37,8 @@
   "rife_model_dir": null,
   "rife_uhd": false,
   "ffmpeg_exe": null,
-  "h264_crf": 18,
-  "h264_preset": "medium",
+  "h264_crf": 0,
+  "h264_preset": "slow",
   "method": "RVM",
   "centroid_mask": true,
   "multi_subject_mode": "all_components"
