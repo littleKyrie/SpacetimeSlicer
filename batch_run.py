@@ -10,6 +10,7 @@ from build_spacetime_slicer import (
     main as run_spacetime_slicer,
     normalize_cli_frame_args,
 )
+from models.edge_composite import validate_edge_strategy
 from utils.reorganize_frame_images import (
     ReorganizationError,
     has_reorganized_frame_structure,
@@ -484,10 +485,15 @@ def run_single_dataset(
         output_dir,
         source_sequence_dir=source_sequence_dir,
     )
-    normalize_cli_frame_args(build_slicer_parser().parse_args(slicer_argv))
+    effective_slicer_args = normalize_cli_frame_args(build_slicer_parser().parse_args(slicer_argv))
+    validate_edge_strategy(
+        effective_slicer_args.edge_composite_strategy, effective_slicer_args.effect_base_mode,
+        effective_slicer_args.live_subject_protect_dilate, effective_slicer_args.method == 'RVM',
+    )
 
     print(f'Input directory: {source_dir}')
     print(f'Output directory: {output_dir}')
+    print(f'Edge composite strategy: {effective_slicer_args.edge_composite_strategy}')
     is_reorganized = structure_checker(
         reorganize_args.input_dir,
         pre_frame_count=reorganize_args.pre_frame_count,

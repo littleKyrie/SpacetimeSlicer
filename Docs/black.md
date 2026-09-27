@@ -1,6 +1,6 @@
 # 人物切片黑边分析与修复计划
 
-日期：2026-09-27。状态：方案阶段，尚未修改合成代码或重渲染成片。
+日期：2026-09-27。状态：第一阶段六种策略、诊断输出与参数快照已实现；原视频的视觉改善仍待实际 RVM 渲染对照。局部 alpha refinement 与前景重合成仍按后续阶段规划。
 
 ## 1. 结论与推荐路线
 
@@ -205,7 +205,7 @@ RVM 本身已有时序状态，优先确保诊断与正式渲染的推理顺序�
 
 ### 策略选择参数：`edge_composite_strategy`
 
-计划在 `configs/spacetime_slicer.json` 增加一个字符串参数，通过改这一个值切换基线与试验策略：
+已在 `configs/spacetime_slicer.json` 增加一个字符串参数，通过改这一个值切换基线与试验策略：
 
 ```json
 {
@@ -213,7 +213,7 @@ RVM 本身已有时序状态，优先确保诊断与正式渲染的推理顺序�
 }
 ```
 
-以上是待加入现有配置的字段示例，不是完整配置文件。**本节仅为参数设计，当前程序尚未实现此字段；现在直接加入 JSON 会被配置解析器判为未知参数。** 实施时必须先接通解析与渲染分支，再将默认值 `legacy` 写入配置。旧配置省略此字段时，也必须自动采用 `legacy`。
+以上是现有配置中的字段示例，不是完整配置文件。JSON/CLI 解析、渲染分支和批处理转发已经接通，配置默认值为 `legacy`；旧配置省略此字段时，同样采用 `legacy`。下表六个取值已可运行。
 
 #### 取值与对照关系
 
@@ -268,7 +268,32 @@ RVM 本身已有时序状态，优先确保诊断与正式渲染的推理顺序�
 6. `soft_foreground`：评估组合方案。
 7. 若 `soft_alpha` 中错误位置的 alpha 仍接近 1，再实施并测试 `refined_soft`，而不是继续调大羽化。
 
-建议支持同名 CLI 参数 `--edge_composite_strategy`，遵循当前“命令行覆盖 JSON”的规则；批处理需确认该参数可以传递到 slicer。每次输出记录实际生效的策略、模型、阈值/膨胀是否参与、帧映射与其他参数快照，并使用不同输出目录或明确的结果清单对应各策略，避免误认历史视频。
+已支持同名 CLI 参数 `--edge_composite_strategy`，遵循当前“命令行覆盖 JSON”的规则；批处理沿用未识别选项转发机制，并在启动时校验、打印最终策略。每次视频输出会生成同名 `.json`，记录实际策略、模型、阈值/膨胀是否参与、有效参数、捕获源帧及逐输出帧的阶段/源帧/机位映射。回收帧记录回收步数和背景源帧，不能把它视作单一源帧的原样复制。
+
+#### 已实现的诊断用法
+
+现有 `--debug_extract_frames` 接受 **从 1 开始的源帧号**，范围必须位于实际切片生成窗口内；不是 MP4 输出帧号。它会调用正式合成路径，从特效起始帧连续推理至最后一个请求帧，采用完整窗口的切片透明度安排，仅保存指定帧、不编码视频。
+
+例如检查第一个样例的源帧 48–61，可在仓库目录运行：
+
+```powershell
+.venv/Scripts/python.exe build_spacetime_slicer.py --input_dir data/0927/QPG_88-2026-09-27-144351 --output_dir data/0927/edge_trials/QPG_88-2026-09-27-144351 --camera_ids 1 --edge_composite_strategy soft_foreground --debug_extract_frames 48:61
+```
+
+这个命令使用当前 JSON 的帧范围等参数，不保证复现历史视频的全部生成设置。第二个样例的源帧 18–26 不在当前默认 `start_frame=25` 的窗口内，必须先按实际生成记录指定起始帧、freeze 帧等参数，再进行相同诊断。
+
+诊断结果按策略分目录保存到 `debug_extractions/<策略>_cam.../`：
+
+- `*_source.png`、`*_alpha.png` 与 `*_alpha_float.npy`：源图、处理后的 8 位 alpha、连续 alpha 数值。
+- `*_binary_protection.png`、`*_continuous_protection.png`、`*_active_protection.png` 与 `*_protection_outline.png`：二值、连续、实际使用的保护和 0.5 等值轮廓。
+- `*_foreground.png`：在 `foreground_only` / `soft_foreground` 中保存同次 RVM 推理得到的 BGR 前景。
+- `*_cutout_rgba.png`、`*_stack_alpha.png`、`*_stack_rgba.png`：当前切片及无真人保护的历史切片栈。
+- `*_unprotected_float_composite.png` 与 `*_composite_preencode.png`：无保护的浮点合成定位图、正式策略的编码前结果。前者使用统一浮点切片栈，和旧逐层量化路径有数值差异；要严格只取消保护，应选择 `diagnostic_no_protection` 查看其编码前结果。
+- `parameters.json`：有效参数、实际连续推理范围、保存帧号、已捕获切片帧号与 alpha 来源。
+
+`legacy` 与 `diagnostic_no_protection` 保留旧 8 位分割接口，其 `.npy` 是 8 位 alpha 归一化后的值；RVM 软策略保留模型连续 alpha。仅有 alpha 的其他策略也可以测试软保护，但其连续值来自原有 8 位结果；快照会标记来源，不把它称为模型原始浮点输出。`edge_feather<0` 时保存的是经过现有腐蚀处理的 alpha。
+
+软策略的稠密历史 alpha 与可选前景颜色使用带余量的 ROI / float16 缓存，计算时恢复 float32；保留原有 8 位几何 mask 用于锚点分析。组合策略不再同时保存完整原始颜色图。ROI 仍可能因模型低值噪声接近全幅，缓存精度和峰值内存需要在真实 4K 样例中继续测量。
 
 ## 5. 实施涉及的文件
 
@@ -277,6 +302,8 @@ RVM 本身已有时序状态，优先确保诊断与正式渲染的推理顺序�
 | `models/seg_strategy.py` | 定义可选前景颜色与连续 alpha 的接口，兼容仅有 alpha 的策略 |
 | `models/rvm.py` | 同一次推理保留 `fgr/pha`，明确 RGB/BGR 转换 |
 | `models/spacetime_slicer.py` | 统一预乘切片栈、一次软保护、静态/回收/画布合成及插值 |
+| `models/edge_composite.py` | 已实现策略校验、ROI 缓存、浮点预乘切片栈；非 legacy 的持久画布路径仍未开放 |
+| `utils/render_manifest.py` | 已实现输出帧阶段、源帧与机位的来源记录 |
 | `build_spacetime_slicer.py` | 接通 `edge_composite_strategy` 的 JSON/CLI 解析、choices 与传参；增加前景、连续保护、边界与编码前合成图诊断；修正诊断推理顺序 |
 | `batch_run.py` | 核对策略参数的配置与 CLI 转发，确保批量渲染记录实际选择的策略 |
 | `configs/spacetime_slicer.json` | 实施时新增 `edge_composite_strategy: legacy`，省略字段也默认 `legacy`；试验结果充分后再讨论默认值变更 |
@@ -295,7 +322,7 @@ RVM 本身已有时序状态，优先确保诊断与正式渲染的推理顺序�
 
 新增样例二输出第 18–26 帧，重点保留第 19、21、22、24 帧。相关捕获切片必须按真实运行记录确定，不能套用样例一的第 25、45 帧。额外保存头顶局部无保护切片栈、保护轮廓叠图，以及缺口内 alpha 的数值分布。
 
-现有 `save_debug_extractions()` 只遍历请求的帧，会令 RVM 时序状态不同于正式渲染。诊断应从正式特效起始帧顺序推理至目标帧，只在需要的帧保存结果；后续如改变预热策略，基线和候选必须同时改变。
+旧 `save_debug_extractions()` 只遍历请求的帧，会令 RVM 时序状态不同于正式渲染。现已改为复用正式特效合成路径，从正式特效起始帧顺序推理至目标帧，只在需要的帧保存结果；后续如改变预热策略，基线和候选必须同时改变。
 
 ### 6.2 对照矩阵
 
@@ -338,4 +365,8 @@ RVM 本身已有时序状态，优先确保诊断与正式渲染的推理顺序�
 - [W3C Compositing and Blending Level 1：简单 alpha 合成](https://www.w3.org/TR/compositing-1/#simplealphacompositing)：说明 source-over 与预乘颜色表达。本文应用到多切片栈的设计是结合项目代码的方案推导。
 - 本地第三方 `RobustVideoMatting/inference.py` 约 128–136 行也保留 `fgr/pha` 并用于合成。
 
-本次完成两个视频的抽帧、局部源图对照、第二样例的像素差值检查、代码审阅和方案记录。新增 A0 诊断与头顶宽黑块的假设、试验分支和验收条件。尚未运行 RVM 重提取、执行算法方案对照、修改实现或宣称黑边已经修复。
+已完成两个视频的抽帧、局部源图对照、第二样例的像素差值检查，以及第一阶段六种策略的代码实现、连续诊断、有效参数与输出帧来源记录。测试覆盖旧合成规则、统一软保护、ROI 缓存、预乘回收、RVM 单次推理/BGR 转换、配置与批处理转发、诊断/正式渲染一致性及六种策略的实际 FFmpeg 编解码。
+
+实施检查：108 项相关单元/集成测试通过。另以修改前的 `HEAD` 代码作为参考，在 `source/patched_canvas × freeze/start/median` 六组完整渲染场景中确认默认路径的全部编码前帧逐像素一致；该检查使用可重复的合成输入与分割结果，不代表真实 RVM 视觉效果验收。
+
+尚未对这两个原视频进行实际 RVM 策略重渲染及视觉验收，不宣称黑边已经消除。`refined_soft` 与 `layered_recompose` 仍未开放；需要按 A0/A/B 的结果决定后续实现。

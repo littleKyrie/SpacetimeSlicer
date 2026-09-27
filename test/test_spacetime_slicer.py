@@ -208,11 +208,16 @@ class SpacetimeSlicerTest(unittest.TestCase):
         self.assertEqual(args.recovery_timing, 'before_freeze')
 
     def test_multi_subject_mode_defaults_to_largest_component(self):
-        args = build_parser().parse_args([
-            '--input_dir', 'data',
-            '--output_dir', 'results',
-            '--freeze_frame', '125',
-        ])
+        # Test the parser default independently of the user's checked-in config.
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_path = Path(temp_dir) / 'slicer.json'
+            config_path.write_text('{}', encoding='utf-8')
+            args = build_parser().parse_args([
+                '--config', str(config_path),
+                '--input_dir', 'data',
+                '--output_dir', 'results',
+                '--freeze_frame', '125',
+            ])
 
         self.assertEqual(args.multi_subject_mode, 'largest_component')
 

@@ -9,6 +9,7 @@
   "end_frame": null,
   "ghost_interval": 20,
   "edge_feather": 0,
+  "edge_composite_strategy": "legacy",
   "fade_duration_frames": 12,
   "ghost_opacity_start": 0.2,
   "ghost_opacity_end": 1.0,

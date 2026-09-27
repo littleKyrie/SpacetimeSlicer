@@ -59,7 +59,9 @@ source 模式建议明确设置：
       --pre-frame-count 75 `
       --start_frame 1 `
       --freeze_frame 75 `
-      --datasets QPB_75-2026-07-22-213900
+      --datasets QPB_75-2026-07-22-213900 `
+      --fade_duration_frames 12 `
+      --edge_composite_strategy soft_alpha
 
 0722update:为测试分割手持扇子，对  QPG_88-2026-07-22-091351  +rembg 方法进行测试
 

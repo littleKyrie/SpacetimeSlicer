@@ -1,11 +1,18 @@
 import cv2
 import os
 import re
+import json
 import numpy as np
 import torch
 from models.rife_ncnn import NeuralSlowMotionWriter
 from utils.ffmpeg_video import FfmpegH264Writer, resolve_ffmpeg_executable
 from utils.opencv_io import imread_required
+from utils.render_manifest import output_frame_mapping
+from models.seg_strategy import MattingResult
+from models.edge_composite import (
+    SOFT_EDGE_STRATEGIES, FOREGROUND_EDGE_STRATEGIES, validate_edge_strategy,
+    cache_ghost, ghost_alpha, ghost_frame, compose_soft_stack,
+)
 
 
 FRAME_DIR_PATTERN = re.compile(r'^\d+$')
@@ -304,7 +311,34 @@ class SpacetimeSlicer:
     def get_ghost_geometry(self, ghost):
         return self.get_ghost_layout(ghost)['geometry']
 
-    def align_ghost_to_center(self, ghost, target_center):
+    def extract_subject(self, strategy, frame, frame_idx, edge_feather=0):
+        name = getattr(self, 'edge_composite_strategy', 'legacy')
+        matting = None
+        if name in ('legacy', 'diagnostic_no_protection'):
+            alpha = strategy.process_frame(frame, frame_idx)
+        else:
+            include_foreground = name in FOREGROUND_EDGE_STRATEGIES
+            if hasattr(strategy, 'process_matting'):
+                matting = strategy.process_matting(frame, frame_idx, include_foreground)
+            else:
+                if include_foreground:
+                    raise ValueError('The segmentation strategy does not provide foreground colors')
+                matting = MattingResult(strategy.process_frame(frame, frame_idx).astype(np.float32) / 255)
+            if include_foreground and matting.foreground is None:
+                raise ValueError('The segmentation strategy returned no foreground colors')
+            alpha = np.clip(matting.alpha * 255, 0, 255).astype(np.uint8)
+        if edge_feather < 0:
+            kernel = np.ones((3, 3), np.uint8)
+            alpha = cv2.erode(alpha, kernel, iterations=abs(edge_feather))
+            if matting is not None and name in SOFT_EDGE_STRATEGIES:
+                matting = MattingResult(
+                    cv2.erode(matting.alpha, kernel, iterations=abs(edge_feather)),
+                    matting.foreground,
+                    matting.alpha_origin,
+                )
+        return alpha, matting
+
+    def align_ghost_to_center(self, ghost, target_center, continuous=False):
         """Translate a cutout to the interpolated center without changing its body proportions."""
         frame_h, frame_w = ghost['alpha'].shape
         source_layout = self.get_ghost_layout(ghost)
@@ -341,11 +375,27 @@ class SpacetimeSlicer:
         source_w = min(source_w, frame_w - source_x)
         source_h = min(source_h, frame_h - source_y)
 
-        frame_crop = ghost['frame'][source_y:source_y + source_h, source_x:source_x + source_w]
-        alpha_crop = ghost['alpha'][source_y:source_y + source_h, source_x:source_x + source_w]
+        if continuous and 'matte_roi' in ghost:
+            # Recovery geometry still uses its existing anchor. Preserve the
+            # soft support outside the byte-mask bbox when moving all subjects.
+            if getattr(self, 'multi_subject_mode', 'largest_component') == 'all_components':
+                crop_x0, crop_y0, crop_x1, crop_y1 = ghost['matte_roi']
+            else:
+                crop_x0, crop_y0 = max(0, source_x - 2), max(0, source_y - 2)
+                crop_x1 = min(frame_w, source_x + source_w + 2)
+                crop_y1 = min(frame_h, source_y + source_h + 2)
+            target_x += crop_x0 - source_x
+            target_y += crop_y0 - source_y
+            source_x, source_y = crop_x0, crop_y0
+            source_w, source_h = crop_x1 - crop_x0, crop_y1 - crop_y0
 
-        aligned_frame = np.zeros_like(ghost['frame'])
-        aligned_alpha = np.zeros_like(ghost['alpha'])
+        frame = ghost_frame(ghost)
+        alpha = ghost_alpha(ghost) * 255 if continuous else ghost['alpha']
+        frame_crop = frame[source_y:source_y + source_h, source_x:source_x + source_w]
+        alpha_crop = alpha[source_y:source_y + source_h, source_x:source_x + source_w]
+
+        aligned_frame = np.zeros_like(frame)
+        aligned_alpha = np.zeros_like(alpha)
         dst_x0 = max(0, target_x)
         dst_y0 = max(0, target_y)
         dst_x1 = min(frame_w, target_x + source_w)
@@ -372,7 +422,8 @@ class SpacetimeSlicer:
                         live_subject_opacity=1.0,
                         live_subject_alpha_threshold=16,
                         live_subject_protect_dilate=2,
-                        tracking_end_idx=None):
+                        tracking_end_idx=None, frame_observer=None,
+                        stop_after_idx=None):
         """Generate visible slice frames and retain dense subject samples for recovery."""
         if effect_base_mode not in ('source', 'patched_canvas'):
             raise ValueError(f"Unknown effect base mode: {effect_base_mode}")
@@ -383,6 +434,9 @@ class SpacetimeSlicer:
         if live_subject_protect_dilate < 0:
             raise ValueError("live_subject_protect_dilate must not be negative")
 
+        edge_strategy = getattr(self, 'edge_composite_strategy', 'legacy')
+        validate_edge_strategy(edge_strategy, effect_base_mode, live_subject_protect_dilate,
+                               getattr(strategy, 'supports_foreground', False))
         num_ghosts_expected = max(1, ((end_idx - 1 - start_idx) // ghost_interval) + 1)
         ghost_opacities = np.linspace(ghost_opacity_start, ghost_opacity_end, num_ghosts_expected)
 
@@ -396,17 +450,15 @@ class SpacetimeSlicer:
         last_frame_output = None
 
         for i in range(start_idx, tracking_end_idx):
+            if stop_after_idx is not None and i > stop_after_idx:
+                break
             current_frame = self.read_frame(i, camera_id)
             base_frame = current_frame
             is_output_frame = i < end_idx
             should_be_ghost = (
                 is_output_frame and (i - start_idx) % ghost_interval == 0
             )
-            alpha_mask = strategy.process_frame(current_frame, i)
-
-            if edge_feather < 0:
-                kernel = np.ones((3, 3), np.uint8)
-                alpha_mask = cv2.erode(alpha_mask, kernel, iterations=abs(edge_feather))
+            alpha_mask, matting = self.extract_subject(strategy, current_frame, i, edge_feather)
 
             if (
                 i == start_idx
@@ -456,11 +508,11 @@ class SpacetimeSlicer:
                     ).astype(np.uint8)
 
             sample_idx = len(all_ghosts)
-            all_ghosts.append({
-                'frame': current_frame.copy(),
-                'alpha': alpha_mask.copy(),
-                'opacity': sample_opacity,
-            })
+            all_ghosts.append(cache_ghost(
+                current_frame, alpha_mask, sample_opacity, matting,
+                soft=edge_strategy in SOFT_EDGE_STRATEGIES,
+                use_foreground=edge_strategy in FOREGROUND_EDGE_STRATEGIES,
+            ))
 
             if should_be_ghost:
                 permanent_indices.append(sample_idx)
@@ -474,7 +526,8 @@ class SpacetimeSlicer:
                     base_frame,
                     all_ghosts,
                     permanent_indices,
-                    live_subject_alpha=alpha_mask,
+                    live_subject_alpha=(matting.alpha * 255
+                                        if edge_strategy in SOFT_EDGE_STRATEGIES else alpha_mask),
                     live_subject_alpha_threshold=live_subject_alpha_threshold,
                     live_subject_protect_dilate=live_subject_protect_dilate,
                 )
@@ -494,6 +547,8 @@ class SpacetimeSlicer:
                     canvas_ghosts * (1 - live_alpha)
                 ).astype(np.uint8)
             last_frame_output = frame_output
+            if frame_observer is not None:
+                frame_observer(i, current_frame, alpha_mask, matting, frame_output)
 
             stage_writer.write(frame_output, i)
 
@@ -552,11 +607,12 @@ class SpacetimeSlicer:
             ratio,
         )
         target_center = target_geometry[:2]
+        continuous = getattr(self, 'edge_composite_strategy', 'legacy') in SOFT_EDGE_STRATEGIES
         lower_frame, lower_alpha = self.align_ghost_to_center(
-            all_ghosts[lower_idx], target_center
+            all_ghosts[lower_idx], target_center, continuous=continuous
         )
         upper_frame, upper_alpha = self.align_ghost_to_center(
-            all_ghosts[upper_idx], target_center
+            all_ghosts[upper_idx], target_center, continuous=continuous
         )
         lower_alpha_f = lower_alpha.astype(np.float32) / 255.0
         upper_alpha_f = upper_alpha.astype(np.float32) / 255.0
@@ -565,6 +621,8 @@ class SpacetimeSlicer:
             lower_frame.astype(np.float32) * lower_alpha_f[:, :, np.newaxis] * (1.0 - ratio) +
             upper_frame.astype(np.float32) * upper_alpha_f[:, :, np.newaxis] * ratio
         )
+        if continuous:
+            return {'premultiplied': mixed_premultiplied, 'alpha': mixed_alpha_f * 255}
         mixed_frame = np.divide(
             mixed_premultiplied,
             mixed_alpha_f[:, :, np.newaxis],
@@ -598,6 +656,17 @@ class SpacetimeSlicer:
         if dilate_iterations < 0:
             raise ValueError("dilate_iterations must not be negative")
 
+        name = getattr(self, 'edge_composite_strategy', 'legacy')
+        if name == 'diagnostic_no_protection':
+            return None
+        if name in SOFT_EDGE_STRATEGIES:
+            if dilate_iterations != 0:
+                raise ValueError(f'edge_composite_strategy={name} requires live_subject_protect_dilate=0')
+            alpha = np.clip(alpha_mask.astype(np.float32) / 255, 0, 1)
+            if name == 'soft_smoothstep':
+                alpha = np.clip((alpha - 0.05) / 0.90, 0, 1)
+                alpha = alpha * alpha * (3 - 2 * alpha)
+            return alpha
         protection_mask = (alpha_mask > alpha_threshold).astype(np.uint8)
         if dilate_iterations > 0:
             kernel = np.ones((3, 3), np.uint8)
@@ -610,6 +679,13 @@ class SpacetimeSlicer:
 
     def compose_recovery_frame(self, all_ghosts, permanent_indices, ghost_trajectories, background,
                                frame_offset, subject_protection=None):
+        if getattr(self, 'edge_composite_strategy', 'legacy') in SOFT_EDGE_STRATEGIES:
+            layers = (
+                (self.interpolate_ghost(all_ghosts, ghost_trajectories[p_idx][frame_offset]),
+                 all_ghosts[p_idx].get('opacity', 1.0))
+                for p_idx in permanent_indices if p_idx in ghost_trajectories
+            )
+            return compose_soft_stack(background, layers, subject_protection)
         current_canvas = background.copy()
         for p_idx in permanent_indices:
             trajectory = ghost_trajectories.get(p_idx)
@@ -636,6 +712,9 @@ class SpacetimeSlicer:
             live_subject_alpha_threshold,
             live_subject_protect_dilate,
         )
+        if getattr(self, 'edge_composite_strategy', 'legacy') in SOFT_EDGE_STRATEGIES:
+            layers = ((all_ghosts[i], all_ghosts[i].get('opacity', 1.0)) for i in permanent_indices)
+            return compose_soft_stack(background, layers, subject_protection)
         for p_idx in permanent_indices:
             ghost = all_ghosts[p_idx]
             ghost_opacity = ghost.get('opacity', 1.0)
@@ -740,7 +819,8 @@ class SpacetimeSlicer:
                  multi_subject_mode='largest_component',
                  ffmpeg_executable=None,
                  h264_crf=18,
-                 h264_preset='medium'):
+                 h264_preset='medium', edge_composite_strategy='legacy',
+                 run_parameters=None):
         """
         生成时空切片视频（残影渐变 → 回收 → 多视角凝结 → 继续播放）
 
@@ -797,6 +877,10 @@ class SpacetimeSlicer:
             raise ValueError(f"Unknown freeze interpolation mode: {freeze_interp_mode}")
         if not 0 <= h264_crf <= 51:
             raise ValueError("h264_crf must be between 0 and 51")
+        validate_edge_strategy(edge_composite_strategy, effect_base_mode,
+                               live_subject_protect_dilate,
+                               getattr(strategy, 'supports_foreground', False))
+        self.edge_composite_strategy = edge_composite_strategy
         self.use_centroid = centroid_mask
         self.multi_subject_mode = multi_subject_mode
         resolved_ffmpeg = resolve_ffmpeg_executable(ffmpeg_executable)
@@ -838,7 +922,52 @@ class SpacetimeSlicer:
         os.makedirs(output_dir, exist_ok=True)
 
         video_path = resolve_output_video_path(output_dir)
+        slice_end_idx, total_fade_frames = self.resolve_effect_schedule(
+            effect_start_idx, freeze_idx, fade_duration_frames, recovery_timing
+        )
+        snapshot = dict(run_parameters or {})
+        snapshot.update({
+            'edge_composite_strategy': edge_composite_strategy,
+            'effect_base_mode': effect_base_mode,
+            'segmentation_strategy': type(strategy).__name__,
+            'live_subject_alpha_threshold': live_subject_alpha_threshold,
+            'live_subject_protect_dilate': live_subject_protect_dilate,
+            'protection_parameters_active': edge_composite_strategy in ('legacy', 'foreground_only'),
+            'source_start_frame': effect_start_idx + 1,
+            'source_freeze_frame': freeze_idx + 1,
+            'source_end_frame': effect_end_idx,
+            'source_slice_end_frame': slice_end_idx + 1,
+            'resolved_fade_duration_frames': total_fade_frames,
+            'fps': self.fps,
+            'ghost_interval': ghost_interval, 'edge_feather': edge_feather,
+            'ghost_opacity_start': ghost_opacity_start, 'ghost_opacity_end': ghost_opacity_end,
+            'stretch_head': stretch_head, 'stretch_ghost': stretch_ghost,
+            'stretch_fade': stretch_fade, 'stretch_freeze': stretch_freeze, 'stretch_tail': stretch_tail,
+            'freeze_interp_mode': freeze_interp_mode, 'recovery_timing': recovery_timing,
+            'recovery_transition_frames': recovery_transition_frames,
+            'background_mode': background_mode,
+            'initial_canvas_mode': initial_canvas_mode,
+            'initial_subject_patch_mode': initial_subject_patch_mode,
+            'initial_subject_patch_frame': (None if initial_subject_patch_frame is None
+                                            else initial_subject_patch_frame + 1),
+            'initial_patch_alpha_threshold': initial_patch_alpha_threshold,
+            'initial_patch_dilate': initial_patch_dilate, 'live_subject_opacity': live_subject_opacity,
+            'centroid_mask': centroid_mask, 'multi_subject_mode': multi_subject_mode,
+            'h264_crf': h264_crf, 'h264_preset': h264_preset, 'pixel_format': 'yuv444p',
+            'slice_capture_frame_ids': list(range(effect_start_idx + 1, slice_end_idx + 2, ghost_interval)),
+            'camera_ids': list(camera_ids), 'tail_camera_id': tail_cam,
+            'video_path': os.path.abspath(video_path),
+        })
+        snapshot['frame_mapping'] = output_frame_mapping(snapshot)
+        snapshot['expected_output_frames'] = len(snapshot['frame_mapping'])
+        with open(os.path.splitext(video_path)[0] + '.json', 'w', encoding='utf-8') as manifest:
+            json.dump(snapshot, manifest, ensure_ascii=False, indent=2)
         print(f"Output video: {video_path}")
+        print(f'Edge composite strategy: {edge_composite_strategy}')
+        if edge_composite_strategy in SOFT_EDGE_STRATEGIES:
+            print('  Continuous live alpha; threshold is inactive; protection dilation must be 0.')
+        elif edge_composite_strategy == 'diagnostic_no_protection':
+            print('  DIAGNOSTIC ONLY: live-subject protection is disabled (threshold/dilation inactive).')
         print(
             f"H.264 encoding: libx264, CRF {h264_crf}, preset {h264_preset} "
             f"(FFmpeg: {resolved_ffmpeg})"
@@ -874,10 +1003,6 @@ class SpacetimeSlicer:
 
         all_ghosts = []
         permanent_indices = []
-
-        slice_end_idx, total_fade_frames = self.resolve_effect_schedule(
-            effect_start_idx, freeze_idx, fade_duration_frames, recovery_timing
-        )
 
         # ============ 1. 写入片头 ============
         print("写入片头...")
@@ -949,9 +1074,13 @@ class SpacetimeSlicer:
         recovery_subject_alpha = None
         if effect_base_mode == 'source' and all_ghosts:
             if background_mode == 'freeze':
-                recovery_subject_alpha = all_ghosts[-1]['alpha']
+                recovery_subject_alpha = (ghost_alpha(all_ghosts[-1]) * 255
+                                          if edge_composite_strategy in SOFT_EDGE_STRATEGIES
+                                          else all_ghosts[-1]['alpha'])
             elif background_mode == 'start':
-                recovery_subject_alpha = all_ghosts[0]['alpha']
+                recovery_subject_alpha = (ghost_alpha(all_ghosts[0]) * 255
+                                          if edge_composite_strategy in SOFT_EDGE_STRATEGIES
+                                          else all_ghosts[0]['alpha'])
 
         self.process_fade_out(out, all_ghosts, permanent_indices, fade_background, total_fade_frames,
                               stretch_fade=stretch_fade,

@@ -9,6 +9,10 @@ import numpy as np
 
 from models.rife_ncnn import RifeNcnnInterpolator
 from models.spacetime_slicer import SpacetimeSlicer
+from models.edge_composite import (
+    EDGE_COMPOSITE_STRATEGIES, SOFT_EDGE_STRATEGIES,
+    validate_edge_strategy, ghost_frame, ghost_alpha, compose_soft_stack,
+)
 from utils.opencv_io import imread_required
 
 
@@ -177,7 +181,8 @@ def create_strategy(method, slicer, camera_ids):
 
 
 def save_debug_extractions(strategy, slicer, args, camera_ids, end_frame):
-    debug_frames = parse_frame_ids(args.debug_extract_frames)
+    # CLI frame IDs are one-based, just like start_frame/freeze_frame.
+    debug_frames = {value - 1 for value in parse_frame_ids(args.debug_extract_frames)}
     debug_camera = args.debug_extract_camera
     if debug_camera is None:
         debug_camera = camera_ids[0]
@@ -189,83 +194,118 @@ def save_debug_extractions(strategy, slicer, args, camera_ids, end_frame):
         args.recovery_timing,
     )
     ghost_frames = list(range(args.start_frame, slice_end_idx + 1, args.ghost_interval))
-    ghost_opacities = np.linspace(
-        args.ghost_opacity_start,
-        args.ghost_opacity_end,
-        max(1, len(ghost_frames)),
-    )
-    ghost_opacity_by_frame = {
-        frame_idx: float(ghost_opacities[pos])
-        for pos, frame_idx in enumerate(ghost_frames)
-    }
+    if not debug_frames or min(debug_frames) < args.start_frame or max(debug_frames) > slice_end_idx:
+        raise ValueError(
+            f'debug_extract_frames must be one-based source frame IDs in the slice '
+            f'generation range {args.start_frame + 1}:{slice_end_idx + 1}'
+        )
+    validate_edge_strategy(args.edge_composite_strategy, args.effect_base_mode,
+                           args.live_subject_protect_dilate,
+                           getattr(strategy, 'supports_foreground', False))
+    slicer.edge_composite_strategy = args.edge_composite_strategy
+    slicer.use_centroid = args.centroid_mask
+    slicer.multi_subject_mode = args.multi_subject_mode
 
     output_dir = os.path.join(
         args.output_dir,
         'debug_extractions',
-        f'cam{debug_camera:03d}_s{args.start_frame}_f{args.freeze_frame}_e{end_frame}',
+        f'{args.edge_composite_strategy}_cam{debug_camera:03d}_s{args.start_frame + 1}_f{args.freeze_frame + 1}_e{end_frame}',
     )
     os.makedirs(output_dir, exist_ok=True)
 
     print(f'Debug extraction output: {output_dir}')
-    print(f'Slice capture frames: {ghost_frames}')
+    print(f'Slice capture source frame IDs: {[i + 1 for i in ghost_frames]}')
+    all_ghosts, permanent_indices = [], []
+    saved_frames = []
 
-    for frame_idx in debug_frames:
-        frame = slicer.read_frame(frame_idx, debug_camera)
-        if frame is None:
-            raise ValueError(f'Could not read frame {frame_idx} for camera {debug_camera}')
+    def save_frame(frame_idx, frame, alpha_mask, matting, output):
+        if frame_idx not in debug_frames:
+            return
+        prefix = os.path.join(output_dir, f'frame{frame_idx + 1:04d}_cam{debug_camera:03d}')
 
-        alpha_mask = strategy.process_frame(frame, frame_idx)
-        if args.edge_feather < 0:
-            kernel = np.ones((3, 3), np.uint8)
-            alpha_mask = cv2.erode(alpha_mask, kernel, iterations=abs(args.edge_feather))
+        def write(suffix, pixels):
+            if not cv2.imwrite(f'{prefix}_{suffix}.png', pixels):
+                raise OSError(f'Could not write diagnostic image: {prefix}_{suffix}.png')
 
-        ghost_opacity = ghost_opacity_by_frame.get(frame_idx)
-        if ghost_opacity is None:
-            ghost_opacity = 0.0
-            is_slice_frame = False
-        else:
-            is_slice_frame = True
-
-        ghost_alpha = np.clip(
-            alpha_mask.astype(np.float32) * ghost_opacity,
-            0,
-            255,
-        ).astype(np.uint8)
-        patch_mask = np.where(
-            alpha_mask > args.initial_patch_alpha_threshold,
-            255,
-            0,
-        ).astype(np.uint8)
-        if args.initial_patch_dilate > 0:
-            kernel = np.ones((3, 3), np.uint8)
-            patch_mask = cv2.dilate(patch_mask, kernel, iterations=args.initial_patch_dilate)
-        prefix = os.path.join(output_dir, f'frame{frame_idx:04d}_cam{debug_camera:03d}')
-        cv2.imwrite(f'{prefix}_source.jpg', frame)
-        cv2.imwrite(f'{prefix}_rvm_alpha.png', alpha_mask)
-        cv2.imwrite(
-            f'{prefix}_initial_patch_mask_t{args.initial_patch_alpha_threshold}_d{args.initial_patch_dilate}.png',
-            patch_mask,
+        continuous = matting.alpha if matting is not None else alpha_mask.astype(np.float32) / 255
+        protection = slicer.build_subject_protection_mask(
+            continuous * 255 if args.edge_composite_strategy in SOFT_EDGE_STRATEGIES else alpha_mask,
+            args.live_subject_alpha_threshold, args.live_subject_protect_dilate,
         )
-        raw_rgba = cv2.cvtColor(frame, cv2.COLOR_BGR2BGRA)
-        raw_rgba[:, :, 3] = alpha_mask
-        cv2.imwrite(f'{prefix}_rvm_cutout_rgba.png', raw_rgba)
+        binary = (alpha_mask > args.live_subject_alpha_threshold).astype(np.uint8)
+        if args.live_subject_protect_dilate:
+            binary = cv2.dilate(binary, np.ones((3, 3), np.uint8),
+                                iterations=args.live_subject_protect_dilate)
+        write('source', frame)
+        write('alpha', alpha_mask)
+        np.save(f'{prefix}_alpha_float.npy', continuous)
+        write('binary_protection', binary * 255)
+        write('continuous_protection', np.rint(continuous * 255).astype(np.uint8))
+        actual = np.zeros(alpha_mask.shape, np.float32) if protection is None else protection
+        write('active_protection', np.rint(actual * 255).astype(np.uint8))
+        overlay = frame.copy()
+        contours, _ = cv2.findContours((actual > 0.5).astype(np.uint8),
+                                      cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        cv2.drawContours(overlay, contours, -1, (0, 0, 255), 2)
+        write('protection_outline', overlay)
+        if matting is not None and matting.foreground is not None:
+            write('foreground', np.rint(np.clip(matting.foreground * 255, 0, 255)).astype(np.uint8))
+        cutout = cv2.cvtColor(np.clip(ghost_frame(all_ghosts[-1]), 0, 255).astype(np.uint8),
+                              cv2.COLOR_BGR2BGRA)
+        cutout[:, :, 3] = alpha_mask
+        write('cutout_rgba', cutout)
+        layers = ((all_ghosts[i], all_ghosts[i].get('opacity', 1)) for i in permanent_indices)
+        unprotected, stack_color, stack_alpha = compose_soft_stack(frame, layers, return_stack=True)
+        write('unprotected_float_composite', unprotected)
+        write('stack_alpha', np.rint(stack_alpha * 255).astype(np.uint8))
+        stack_rgb = np.divide(stack_color, stack_alpha[:, :, None],
+                              out=np.zeros_like(stack_color), where=stack_alpha[:, :, None] > 1e-6)
+        stack_rgba = cv2.cvtColor(np.rint(np.clip(stack_rgb, 0, 255)).astype(np.uint8), cv2.COLOR_BGR2BGRA)
+        stack_rgba[:, :, 3] = np.rint(stack_alpha * 255).astype(np.uint8)
+        write('stack_rgba', stack_rgba)
+        write('composite_preencode', output)
+        saved_frames.append({
+            'source_frame_id': frame_idx + 1, 'camera_id': debug_camera,
+            'captured_slice_frame_ids': [args.start_frame + i * args.ghost_interval + 1
+                                         for i in range(len(permanent_indices))],
+            'alpha_min': float(continuous.min()), 'alpha_max': float(continuous.max()),
+            'alpha_mean': float(continuous.mean()),
+            'alpha_origin': matting.alpha_origin if matting is not None else 'normalized_uint8',
+        })
 
-        ghost_rgba = cv2.cvtColor(frame, cv2.COLOR_BGR2BGRA)
-        ghost_rgba[:, :, 3] = ghost_alpha
-        cv2.imwrite(f'{prefix}_slice_rgba_opacity{ghost_opacity:.3f}.png', ghost_rgba)
+    class NullWriter:
+        def write(self, frame):
+            pass
 
-        alpha_3ch = np.repeat((ghost_alpha.astype(np.float32) / 255.0)[:, :, np.newaxis], 3, axis=2)
-        preview_black = (frame.astype(np.float32) * alpha_3ch).astype(np.uint8)
-        cv2.imwrite(f'{prefix}_slice_preview_on_black.jpg', preview_black)
-
-        alpha_values = alpha_mask.reshape(-1)
-        print(
-            f'Frame {frame_idx} cam {debug_camera}: '
-            f'is_slice={is_slice_frame}, ghost_opacity={ghost_opacity:.3f}, '
-            f'alpha min={int(alpha_values.min())}, max={int(alpha_values.max())}, '
-            f'mean={float(alpha_values.mean()):.2f}, '
-            f'pixels>240={int((alpha_values > 240).sum())}'
-        )
+    replacement = slicer.resolve_initial_subject_replacement(
+        args.initial_subject_patch_mode, debug_camera, args.freeze_frame,
+        args.initial_subject_patch_frame,
+    )
+    initial_canvas = slicer.read_frame(args.start_frame, debug_camera)
+    if args.initial_canvas_mode == 'clean' and replacement is not None:
+        initial_canvas = replacement
+    # Use the renderer's full opacity schedule, but stop once requested frames
+    # have been saved. Never skip recurrent-model inputs between debug frames.
+    slicer.process_segment(
+        strategy, debug_camera, args.start_frame, slice_end_idx + 1,
+        args.ghost_interval, args.edge_feather, all_ghosts, permanent_indices, NullWriter(),
+        initial_canvas=initial_canvas, ghost_opacity_start=args.ghost_opacity_start,
+        ghost_opacity_end=args.ghost_opacity_end, stretch_ghost=1,
+        initial_subject_replacement=replacement,
+        initial_patch_alpha_threshold=args.initial_patch_alpha_threshold,
+        initial_patch_dilate=args.initial_patch_dilate, effect_base_mode=args.effect_base_mode,
+        live_subject_opacity=args.live_subject_opacity,
+        live_subject_alpha_threshold=args.live_subject_alpha_threshold,
+        live_subject_protect_dilate=args.live_subject_protect_dilate,
+        frame_observer=save_frame, stop_after_idx=max(debug_frames),
+    )
+    snapshot = dict(vars(args))
+    snapshot.update({'debug_camera': debug_camera, 'frames': saved_frames,
+                     'alpha_float_origin': saved_frames[0]['alpha_origin'],
+                     'unprotected_composite_arithmetic': 'float32_stack',
+                     'inference_source_frame_range': [args.start_frame + 1, max(debug_frames) + 1]})
+    with open(os.path.join(output_dir, 'parameters.json'), 'w', encoding='utf-8') as manifest:
+        json.dump(snapshot, manifest, ensure_ascii=False, indent=2)
 
 
 def build_parser():
@@ -294,6 +334,10 @@ def build_parser():
     parser.add_argument('--end_frame', type=int, default=None, help='1-based source frame ID where output ends, inclusive; defaults to the last source frame.')
     parser.add_argument('--ghost_interval', type=int, default=20)
     parser.add_argument('--edge_feather', type=int, default=0)
+    parser.add_argument(
+        '--edge_composite_strategy', default='legacy', choices=EDGE_COMPOSITE_STRATEGIES,
+        help='Edge compositing strategy. legacy preserves existing rendering; opt-in strategies require source mode.',
+    )
     parser.add_argument('--fade_duration_frames', type=int, default=10, help='Recovery duration in frames.')
     parser.add_argument('--ghost_opacity_start', type=float, default=0.2)
     parser.add_argument('--ghost_opacity_end', type=float, default=1.0)
@@ -418,14 +462,16 @@ def build_parser():
 def main(argv=None):
     start_time = time.time()
     args = normalize_cli_frame_args(build_parser().parse_args(argv))
+    validate_edge_strategy(args.edge_composite_strategy, args.effect_base_mode,
+                           args.live_subject_protect_dilate, args.method == 'RVM')
 
     camera_ids = parse_camera_ids(args.camera_ids)
     print(f'Camera IDs: {camera_ids}')
 
     rife_interpolator = None
-    if args.stretch_ghost > 1 or (
+    if not args.debug_extract_frames and (args.stretch_ghost > 1 or (
         args.freeze_interp_mode == 'rife' and args.stretch_freeze > 1
-    ):
+    )):
         rife_interpolator = RifeNcnnInterpolator(
             executable=args.rife_exe,
             model_dir=args.rife_model_dir,
@@ -497,6 +543,8 @@ def main(argv=None):
             ffmpeg_executable=args.ffmpeg_exe,
             h264_crf=args.h264_crf,
             h264_preset=args.h264_preset,
+            edge_composite_strategy=args.edge_composite_strategy,
+            run_parameters=vars(args),
         )
     finally:
         if rife_interpolator is not None:
